@@ -2,3 +2,6 @@
 /dist/
 *.log
 /AGENTS.md
+/promo/exports/
+/promo/projects/
+/promo/.hyperframes/
