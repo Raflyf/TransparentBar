@@ -85,7 +85,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
 };
@@ -101,6 +101,7 @@ use windows::{
 
 #[derive(Default)]
 struct TreeState {
+    epoch: u64,
     nodes: HashMap<u64, u64>,
     frames: HashSet<u64>,
     saved: HashMap<u64, (IUIElement, f64)>,
@@ -109,6 +110,7 @@ struct TreeState {
 }
 thread_local! { static TREE: RefCell<TreeState> = RefCell::new(TreeState::default()); }
 static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SESSION_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 enum UiDispatcher {
@@ -150,6 +152,7 @@ impl UiDispatcher {
 struct OwnerState {
     dispatcher: UiDispatcher,
     ready: bool,
+    dirty: bool,
 }
 
 struct RestoreCompletion {
@@ -173,6 +176,7 @@ impl RestoreCompletion {
 
 #[derive(Clone)]
 struct Session {
+    epoch: u64,
     diagnostics: AgileReference<IXamlDiagnostics>,
     fallback_dispatcher: UiDispatcher,
     owners: Arc<Mutex<HashMap<u32, OwnerState>>>,
@@ -214,6 +218,22 @@ fn ancestor_frame(state: &TreeState, mut handle: u64) -> Option<u64> {
 }
 
 impl TreeState {
+    fn prepare(&mut self, epoch: u64) -> Result<()> {
+        if self.epoch == epoch {
+            return Ok(());
+        }
+        if !self.saved.is_empty() {
+            return Err(Error::new(
+                E_ILLEGAL_METHOD_CALL,
+                "Backup taskbar sesi lama belum dipulihkan.",
+            ));
+        }
+        *self = Self {
+            epoch,
+            ..Self::default()
+        };
+        Ok(())
+    }
     fn candidates(&self) -> Vec<(u64, u64, bool)> {
         self.pending
             .iter()
@@ -264,19 +284,33 @@ impl Session {
             OwnerState {
                 dispatcher: dispatcher.clone(),
                 ready: false,
+                dirty: false,
             },
         );
         protocol::trace(&format!("Bridge.Owner thread={thread}"));
         Ok(Some((thread, dispatcher)))
     }
 
-    fn update_ready(&self, thread: u32, ready: bool) -> Result<()> {
+    fn begin_change(&self, thread: u32) -> Result<bool> {
+        let mut owners = self.owners.lock().map_err(|_| Error::from(E_UNEXPECTED))?;
+        if !self.active.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let owner = owners
+            .get_mut(&thread)
+            .ok_or_else(|| Error::from(E_UNEXPECTED))?;
+        owner.dirty = true;
+        Ok(true)
+    }
+
+    fn update_ready(&self, thread: u32, ready: bool, dirty: bool) -> Result<()> {
         let mut owners = self.owners.lock().map_err(|_| Error::from(E_UNEXPECTED))?;
         if !self.active.load(Ordering::Acquire) {
             return Ok(());
         }
         if let Some(owner) = owners.get_mut(&thread) {
             owner.ready = ready;
+            owner.dirty = dirty;
         }
         let any_ready = owners.values().any(|owner| owner.ready);
         unsafe {
@@ -314,6 +348,7 @@ impl Session {
             }
             let diagnostics = this.diagnostics.resolve()?;
             TREE.with(|tree| -> Result<()> {
+                tree.borrow_mut().prepare(this.epoch)?;
                 if mutation != 0 {
                     let saved = tree.borrow().saved.get(&handle).cloned();
                     if let Some((element, opacity)) = saved {
@@ -364,6 +399,9 @@ impl Session {
                     unsafe {
                         (element.vtable().GetOpacity)(element.as_raw(), &mut opacity).ok()?;
                         if !this.inspect {
+                            if !this.begin_change(thread)? {
+                                return Ok(());
+                            }
                             // Keep the original before mutation; readback can fail after Windows accepts the setter.
                             tree.borrow_mut()
                                 .saved
@@ -388,7 +426,8 @@ impl Session {
                         this.status.data().borders.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                this.update_ready(thread, tree.borrow().has_background())?;
+                let state = tree.borrow();
+                this.update_ready(thread, state.has_background(), !state.saved.is_empty())?;
                 Ok(())
             })
         };
@@ -406,6 +445,7 @@ impl Session {
             .lock()
             .map_err(|_| Error::from(E_UNEXPECTED))?
             .iter()
+            .filter(|(_, owner)| owner.dirty)
             .map(|(thread, owner)| (*thread, owner.dispatcher.clone()))
             .collect();
         if owners.is_empty() {
@@ -587,6 +627,7 @@ impl IObjectWithSite_Impl for Site_Impl {
                 unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, host)? }.0 as usize,
             ));
             let session = Session {
+                epoch: SESSION_EPOCH.fetch_add(1, Ordering::AcqRel) + 1,
                 diagnostics: AgileReference::new(&diagnostics)?,
                 fallback_dispatcher: dispatcher,
                 owners: Arc::new(Mutex::new(HashMap::new())),
@@ -742,6 +783,18 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_session_clears_clean_thread_cache() {
+        let mut tree = TreeState::default();
+        tree.prepare(1).unwrap();
+        tree.frames.insert(10);
+        tree.nodes.insert(11, 10);
+        tree.pending.insert(11, true);
+        tree.prepare(2).unwrap();
+        assert_eq!(tree.epoch, 2);
+        assert!(tree.frames.is_empty() && tree.nodes.is_empty() && tree.pending.is_empty());
+    }
+
     #[test]
     fn restore_waits_for_every_owner_and_never_hides_failure() {
         let completion = RestoreCompletion::new(2, true);
