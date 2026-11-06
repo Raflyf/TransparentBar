@@ -123,6 +123,10 @@ Bug reports, compatibility results, and focused pull requests are welcome. Check
 
 The project focuses on taskbar transparency and low background overhead. Discuss new features in an issue before adding UI frameworks or runtime dependencies.
 
+### Release policy
+
+Release versions change only when new user-facing features are added. Bug fixes, design updates, and other maintenance keep the current version; the commit SHA and CI run identify each build. Portable packages include `BUILD.txt` with the version and source commit.
+
 ## License
 
 [MIT](https://github.com/Raflyf/transparentbar/blob/main/LICENSE.md) © Rafly Firmansyah.
