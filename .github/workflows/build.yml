@@ -21,6 +21,15 @@ jobs:
       RUSTFLAGS: '-C target-feature=+crt-static'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Validate release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $notes = Join-Path 'release-notes' ($env:RELEASE_TAG + '.md')
+          if (-not (Test-Path -LiteralPath $notes -PathType Leaf)) { throw "Missing release notes: $notes" }
+          $title = Get-Content -LiteralPath $notes -TotalCount 1
+          if ($title -ne "## TransparentBar $env:RELEASE_TAG") { throw 'Release notes title does not match the tag.' }
       - name: Set Rust toolchain
         run: |
           rustup default stable-x86_64-pc-windows-msvc
@@ -76,6 +85,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/download-artifact@v5
         with:
           name: TransparentBar-windows-x64
@@ -85,4 +95,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" dist/TransparentBar-windows-x64.zip dist/TransparentBar-setup.exe --title "TransparentBar $RELEASE_TAG" --generate-notes
+        run: gh release create "$RELEASE_TAG" dist/TransparentBar-windows-x64.zip dist/TransparentBar-setup.exe --title "TransparentBar $RELEASE_TAG" --verify-tag --notes-file "release-notes/$RELEASE_TAG.md"

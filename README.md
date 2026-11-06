@@ -145,7 +145,7 @@ The project focuses on taskbar transparency and low background overhead. Discuss
 
 ### Release policy
 
-New features and bug fixes receive a new release version. Bug-fix releases increment the patch version. Design-only updates, documentation, and other maintenance keep the current version; the commit SHA and CI run identify each build. Portable packages include `BUILD.txt` with the version and source commit.
+New features and bug fixes receive a new release version. Bug-fix releases increment the patch version. Design-only updates, documentation, and other maintenance keep the current version; the commit SHA and CI run identify each build. Portable packages include `BUILD.txt` with the version and source commit. Each release displays its changelog directly; the source notes are maintained in [release-notes](https://github.com/Raflyf/TransparentBar/tree/main/release-notes).
 
 ## License
 
