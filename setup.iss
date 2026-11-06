@@ -1,0 +1,42 @@
+[Setup]
+AppId={{C38347CB-7CD0-4D9F-BEE5-05204A3B269F}
+AppName=TransparentBar
+AppVersion=0.1.0
+AppPublisher=Rafly Firmansyah
+AppPublisherURL=https://github.com/Raflyf/transparentbar
+DefaultDirName={localappdata}\Programs\TransparentBar
+DefaultGroupName=TransparentBar
+PrivilegesRequired=lowest
+ArchitecturesAllowed=x64os
+ArchitecturesInstallIn64BitMode=x64os
+MinVersion=10.0
+OutputDir=dist
+OutputBaseFilename=TransparentBar-setup
+Compression=lzma2
+SolidCompression=yes
+WizardStyle=modern
+UninstallDisplayIcon={app}\transparentbar.exe
+AppMutex=Local\TransparentBar.SingleInstance
+CloseApplications=yes
+RestartApplications=no
+LicenseFile=LICENSE.md
+
+[Files]
+Source: "dist\TransparentBar\transparentbar.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\TransparentBar\transparentbar_bridge.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "LICENSE.md"; DestDir: "{app}"
+Source: "README.md"; DestDir: "{app}"
+
+[Tasks]
+Name: "desktopicon"; Description: "Buat shortcut desktop"; Flags: unchecked
+Name: "startup"; Description: "Jalankan saat login"; Flags: unchecked
+
+[Icons]
+Name: "{group}\TransparentBar"; Filename: "{app}\transparentbar.exe"
+Name: "{userdesktop}\TransparentBar"; Filename: "{app}\transparentbar.exe"; Tasks: desktopicon
+
+[Registry]
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "TransparentBar"; ValueData: """{app}\transparentbar.exe"""; Flags: uninsdeletevalue; Tasks: startup
+
+[Run]
+Filename: "{app}\transparentbar.exe"; Description: "Buka TransparentBar"; Flags: nowait postinstall skipifsilent
