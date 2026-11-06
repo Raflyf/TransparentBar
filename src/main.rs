@@ -368,7 +368,7 @@ fn show_error(error: &Error) {
     let text = wide(std::ffi::OsStr::new(&format!(
         "{error}
 
-Tutup aplikasi pengubah taskbar lain, lalu coba lagi."
+Kirim pesan error ini untuk diagnosis. Detail startup: %LOCALAPPDATA%\\TransparentBar\\startup.log"
     )));
     unsafe {
         MessageBoxW(None, PCWSTR(text.as_ptr()), NAME, MB_OK | MB_ICONERROR);
@@ -700,6 +700,7 @@ fn diagnose() -> Result<()> {
     protocol::trace("Host.Diagnose start");
     let session = XamlSession::connect(2)?;
     let start = std::time::Instant::now();
+    let mut ready = false;
     unsafe {
         while start.elapsed() < std::time::Duration::from_secs(8) {
             let mut message = MSG::default();
@@ -708,14 +709,20 @@ fn diagnose() -> Result<()> {
                 DispatchMessageW(&message);
             }
             if session.ready()? {
-                protocol::trace("Host.Diagnose Ready");
+                protocol::trace("Host.Diagnose Ready (read-only)");
+                ready = true;
                 break;
             }
             let _ = MsgWaitForMultipleObjects(None, false, 100, QS_ALLINPUT);
         }
     }
-    protocol::trace("Host.Diagnose stop");
-    session.restore()
+    let detail = session.status.describe();
+    protocol::trace(&format!("Host.Diagnose stop: {detail}"));
+    let restore = session.restore();
+    if !ready {
+        return Err(Error::new(E_FAIL, format!("Diagnostic timeout: {detail}")));
+    }
+    restore
 }
 
 fn main() {
