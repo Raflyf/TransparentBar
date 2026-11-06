@@ -1,7 +1,7 @@
 [Setup]
 AppId={{C38347CB-7CD0-4D9F-BEE5-05204A3B269F}
 AppName=TransparentBar
-AppVersion=0.1.0
+AppVersion=0.1.1
 AppPublisher=Rafly Firmansyah
 AppPublisherURL=https://github.com/Raflyf/transparentbar
 DefaultDirName={localappdata}\Programs\TransparentBar
@@ -15,6 +15,7 @@ OutputBaseFilename=TransparentBar-setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=assets\transparentbar.ico
 UninstallDisplayIcon={app}\transparentbar.exe
 AppMutex=Local\TransparentBar.SingleInstance
 CloseApplications=yes
@@ -23,7 +24,7 @@ LicenseFile=LICENSE.md
 
 [Files]
 Source: "dist\TransparentBar\transparentbar.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\TransparentBar\transparentbar_bridge.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\TransparentBar\transparentbar_bridge-0.1.1.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "LICENSE.md"; DestDir: "{app}"
 Source: "README.md"; DestDir: "{app}"
 

@@ -87,6 +87,7 @@ use std::{
 };
 use windows::{
     core::{implement, AgileReference, Error, Interface, Result, BSTR, GUID, PCWSTR},
+    System::{DispatcherQueue, DispatcherQueueHandler},
     Win32::{
         Foundation::*,
         System::{Com::*, Ole::*, Threading::*},
@@ -100,18 +101,58 @@ struct TreeState {
     frames: HashSet<u64>,
     saved: HashMap<u64, (IUIElement, f64)>,
     targets: HashMap<u64, (u64, bool)>,
+    pending: HashMap<u64, bool>,
 }
 thread_local! { static TREE: RefCell<TreeState> = RefCell::new(TreeState::default()); }
 static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
+enum UiDispatcher {
+    Core(CoreDispatcher),
+    Queue(DispatcherQueue),
+}
+impl UiDispatcher {
+    fn from_object(object: &IUnknown) -> Result<Self> {
+        if let Ok(queue) = object.cast::<DispatcherQueue>() {
+            return Ok(Self::Queue(queue));
+        }
+        object.cast::<CoreDispatcher>().map(Self::Core)
+    }
+    fn has_thread_access(&self) -> Result<bool> {
+        match self {
+            Self::Core(dispatcher) => dispatcher.HasThreadAccess(),
+            Self::Queue(dispatcher) => dispatcher.HasThreadAccess(),
+        }
+    }
+    fn enqueue(&self, action: impl Fn() -> Result<()> + Send + 'static) -> Result<()> {
+        match self {
+            Self::Core(dispatcher) => {
+                dispatcher.RunAsync(
+                    CoreDispatcherPriority::Normal,
+                    &DispatchedHandler::new(action),
+                )?;
+            }
+            Self::Queue(dispatcher) => {
+                if !dispatcher.TryEnqueue(&DispatcherQueueHandler::new(action))? {
+                    return Err(Error::new(E_FAIL, "Dispatcher taskbar sedang berhenti."));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 struct Session {
     diagnostics: AgileReference<IXamlDiagnostics>,
-    dispatcher: CoreDispatcher,
+    dispatcher: UiDispatcher,
     active: Arc<AtomicBool>,
     ready: Arc<OwnedHandle>,
     failed: Arc<OwnedHandle>,
     done: Arc<OwnedHandle>,
+    inspect: bool,
+    seen: Arc<AtomicBool>,
+    status: Arc<protocol::StatusChannel>,
 }
 struct OwnedHandle(usize);
 impl OwnedHandle {
@@ -141,30 +182,39 @@ fn ancestor_frame(state: &TreeState, mut handle: u64) -> Option<u64> {
     None
 }
 
-fn bstr_text(raw: *mut u16) -> String {
-    if raw.is_null() {
-        return String::new();
+impl TreeState {
+    fn candidates(&self) -> Vec<(u64, u64, bool)> {
+        self.pending
+            .iter()
+            .filter_map(|(handle, fill)| {
+                if self.targets.contains_key(handle) {
+                    return None;
+                }
+                let parent = *self.nodes.get(handle)?;
+                ancestor_frame(self, parent).map(|frame| (*handle, frame, *fill))
+            })
+            .collect()
     }
-    unsafe {
-        let raw_ref = std::mem::ManuallyDrop::new(BSTR::from_raw(raw));
-        raw_ref.to_string()
+    fn has_background(&self) -> bool {
+        self.targets
+            .values()
+            .any(|(frame, fill)| *fill && self.frames.contains(frame))
     }
 }
 
 fn queue(session: &Session, action: impl Fn() -> Result<()> + Send + 'static) -> Result<()> {
     let failed = session.failed.clone();
-    session.dispatcher.RunAsync(
-        CoreDispatcherPriority::Normal,
-        &DispatchedHandler::new(move || {
-            let result = action();
-            if result.is_err() {
-                unsafe {
-                    let _ = SetEvent(failed.raw());
-                }
+    let status = session.status.clone();
+    session.dispatcher.enqueue(move || {
+        let result = action();
+        if let Err(error) = &result {
+            status.fail(error.code());
+            unsafe {
+                let _ = SetEvent(failed.raw());
             }
-            result
-        }),
-    )?;
+        }
+        result
+    })?;
     Ok(())
 }
 
@@ -195,82 +245,86 @@ impl Session {
                         }
                         tree.borrow_mut().saved.remove(&handle);
                     }
-                    let mut state = tree.borrow_mut();
-                    state.nodes.remove(&handle);
-                    state.frames.remove(&handle);
-                    state.targets.remove(&handle);
-                    let complete = state.frames.iter().any(|frame| {
-                        state
-                            .targets
-                            .values()
-                            .any(|(owner, fill)| owner == frame && *fill)
-                            && state
-                                .targets
-                                .values()
-                                .any(|(owner, fill)| owner == frame && !*fill)
-                    });
-                    if !complete {
-                        unsafe {
-                            ResetEvent(this.ready.raw())?;
-                        }
+                    {
+                        let mut state = tree.borrow_mut();
+                        state.nodes.remove(&handle);
+                        state.frames.remove(&handle);
+                        state.targets.remove(&handle);
+                        state.pending.remove(&handle);
                     }
-                    return Ok(());
-                }
-                let frame = {
+                } else {
                     let mut state = tree.borrow_mut();
                     state.nodes.insert(handle, relation.parent);
                     if kind == "Taskbar.TaskbarFrame" {
-                        state.frames.insert(handle);
+                        if state.frames.insert(handle) {
+                            this.status.data().frames.fetch_add(1, Ordering::Relaxed);
+                        }
+                        this.status.stage(8);
                     }
-                    if kind != "Windows.UI.Xaml.Shapes.Rectangle"
-                        || !matches!(name.as_str(), "BackgroundFill" | "BackgroundStroke")
-                        || state.saved.contains_key(&handle)
+                    if kind == "Windows.UI.Xaml.Shapes.Rectangle"
+                        && matches!(name.as_str(), "BackgroundFill" | "BackgroundStroke")
                     {
-                        return Ok(());
+                        state.pending.insert(handle, name == "BackgroundFill");
+                        if name == "BackgroundFill" {
+                            this.status.stage(9);
+                        }
                     }
-                    let Some(frame) = ancestor_frame(&state, relation.parent) else {
-                        return Ok(());
-                    };
-                    frame
-                };
-                let mut raw = std::ptr::null_mut();
-                unsafe {
-                    diagnostics
-                        .GetIInspectableFromHandle(handle, &mut raw)
-                        .ok()?;
                 }
-                if raw.is_null() {
-                    return Err(Error::from(E_POINTER));
+                let candidates = tree.borrow().candidates();
+                for (target, frame, fill) in candidates {
+                    let mut raw = std::ptr::null_mut();
+                    unsafe {
+                        diagnostics
+                            .GetIInspectableFromHandle(target, &mut raw)
+                            .ok()?;
+                    }
+                    if raw.is_null() {
+                        return Err(Error::from(E_POINTER));
+                    }
+                    let object = unsafe { IUnknown::from_raw(raw) };
+                    let element: IUIElement = object.cast()?;
+                    let mut opacity = 0.0;
+                    unsafe {
+                        (element.vtable().GetOpacity)(element.as_raw(), &mut opacity).ok()?;
+                        if !this.inspect {
+                            // Keep the original before mutation; readback can fail after Windows accepts the setter.
+                            tree.borrow_mut()
+                                .saved
+                                .entry(target)
+                                .or_insert_with(|| (element.clone(), opacity));
+                            (element.vtable().SetOpacity)(element.as_raw(), 0.0).ok()?;
+                            let mut actual = f64::NAN;
+                            (element.vtable().GetOpacity)(element.as_raw(), &mut actual).ok()?;
+                            if actual != 0.0 {
+                                return Err(Error::new(
+                                    E_FAIL,
+                                    "Readback opacity taskbar bukan 0.",
+                                ));
+                            }
+                        }
+                    }
+                    let mut state = tree.borrow_mut();
+                    state.targets.insert(target, (frame, fill));
+                    if fill {
+                        this.status.data().fills.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        this.status.data().borders.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-                let object = unsafe { IUnknown::from_raw(raw) };
-                let element: IUIElement = object.cast()?;
-                let mut opacity = 0.0;
-                unsafe {
-                    (element.vtable().GetOpacity)(element.as_raw(), &mut opacity).ok()?;
-                    (element.vtable().SetOpacity)(element.as_raw(), 0.0).ok()?;
-                }
-                let mut state = tree.borrow_mut();
-                state.saved.insert(handle, (element, opacity));
-                state
-                    .targets
-                    .insert(handle, (frame, name == "BackgroundFill"));
-                let fill = state
-                    .targets
-                    .values()
-                    .any(|(owner, fill)| *owner == frame && *fill);
-                let border = state
-                    .targets
-                    .values()
-                    .any(|(owner, fill)| *owner == frame && !*fill);
-                if fill && border {
+                if tree.borrow().has_background() {
+                    this.status.stage(10);
                     unsafe {
                         SetEvent(this.ready.raw())?;
+                    }
+                } else {
+                    unsafe {
+                        ResetEvent(this.ready.raw())?;
                     }
                 }
                 Ok(())
             })
         };
-        if self.dispatcher.HasThreadAccess()? {
+        if self.dispatcher.has_thread_access()? {
             action()
         } else {
             queue(self, action)
@@ -279,6 +333,8 @@ impl Session {
 
     fn restore(&self) -> Result<()> {
         self.active.store(false, Ordering::Release);
+        self.status.stage(11);
+        let status = self.status.clone();
         let done = self.done.clone();
         queue(self, move || {
             let saved = TREE.with(|tree| std::mem::take(&mut tree.borrow_mut().saved));
@@ -303,6 +359,7 @@ impl Session {
                 return Err(error);
             }
             SESSION_ACTIVE.store(false, Ordering::Release);
+            status.stage(12);
             unsafe {
                 SetEvent(done.raw())?;
             }
@@ -322,17 +379,38 @@ impl ITreeCallback_Impl for Watcher_Impl {
         element: VisualElement,
         mutation: i32,
     ) -> HRESULT {
+        // XAML diagnostics transfers these four BSTRs to the callback, including inactive callbacks.
+        let _file = BSTR::from_raw(element.source.file);
+        let _hash = BSTR::from_raw(element.source.hash);
+        let kind_text = BSTR::from_raw(element.kind);
+        let name_text = BSTR::from_raw(element.name);
         if !self.session.active.load(Ordering::Acquire) {
             return S_OK;
         }
-        let result = self.session.mutation(
-            relation,
-            element.handle,
-            bstr_text(element.kind),
-            bstr_text(element.name),
-            mutation,
-        );
-        if result.is_err() {
+        self.session
+            .status
+            .data()
+            .callbacks
+            .fetch_add(1, Ordering::Relaxed);
+        self.session.status.stage(7);
+        if !self.session.seen.swap(true, Ordering::AcqRel) {
+            protocol::trace("Bridge.Callback received");
+        }
+        let kind = kind_text.to_string();
+        let name = name_text.to_string();
+        if kind == "Taskbar.TaskbarFrame"
+            || matches!(name.as_str(), "BackgroundFill" | "BackgroundStroke")
+        {
+            protocol::trace(&format!(
+                "Bridge.Target handle={} parent={} type={kind} name={name} mutation={mutation}",
+                element.handle, relation.parent
+            ));
+        }
+        let result = self
+            .session
+            .mutation(relation, element.handle, kind, name, mutation);
+        if let Err(error) = &result {
+            self.session.status.fail(error.code());
             let _ = SetEvent(self.session.failed.raw());
         }
         result.into()
@@ -345,31 +423,38 @@ struct Site {
 }
 impl IObjectWithSite_Impl for Site_Impl {
     fn SetSite(&self, site: Option<&IUnknown>) -> Result<()> {
+        protocol::trace("Bridge.SetSite");
         let Some(site) = site else {
             *self.site.lock().map_err(|_| Error::from(E_UNEXPECTED))? = None;
             return Ok(());
         };
+        let status = Arc::new(protocol::StatusChannel::open(unsafe {
+            GetCurrentProcessId()
+        })?);
+        status.stage(2);
         if SESSION_ACTIVE.swap(true, Ordering::AcqRel) {
+            status.fail(E_ILLEGAL_METHOD_CALL);
             return Err(Error::from(E_ILLEGAL_METHOD_CALL));
         }
         let result = (|| -> Result<()> {
+            status.stage(3);
+            protocol::trace("Bridge.QueryDiagnostics");
             let diagnostics: IXamlDiagnostics = site.cast()?;
+            protocol::trace("Bridge.QueryTree");
             let tree: ITreeService = site.cast()?;
             let mut raw = std::ptr::null_mut();
             unsafe {
+                protocol::trace("Bridge.GetDispatcher");
                 diagnostics.GetDispatcher(&mut raw).ok()?;
             }
             if raw.is_null() {
                 return Err(Error::from(E_POINTER));
             }
-            let dispatcher: CoreDispatcher = unsafe { IUnknown::from_raw(raw) }.cast()?;
-            let mut init = std::ptr::null_mut();
-            unsafe {
-                diagnostics.GetInitializationData(&mut init).ok()?;
-            }
-            let initialization = unsafe { BSTR::from_raw(init) };
-            let (host, shell, generation) =
-                protocol::parse_init(&initialization.to_string()).map_err(Error::from)?;
+            status.stage(4);
+            protocol::trace("Bridge.ResolveDispatcher");
+            let dispatcher = UiDispatcher::from_object(&unsafe { IUnknown::from_raw(raw) })?;
+            status.stage(5);
+            let (host, shell, generation, inspect) = status.initialization()?;
             if shell != unsafe { GetCurrentProcessId() } {
                 return Err(Error::from(E_INVALIDARG));
             }
@@ -391,6 +476,9 @@ impl IObjectWithSite_Impl for Site_Impl {
                 diagnostics: AgileReference::new(&diagnostics)?,
                 dispatcher,
                 active: Arc::new(AtomicBool::new(true)),
+                inspect,
+                status: status.clone(),
+                seen: Arc::new(AtomicBool::new(false)),
                 ready,
                 failed,
                 done,
@@ -413,7 +501,10 @@ impl IObjectWithSite_Impl for Site_Impl {
                         let result = (|| -> Result<()> {
                             let tree = tree.resolve()?;
                             let callback = callback.resolve()?;
+                            session.status.stage(6);
+                            protocol::trace("Bridge.Advise");
                             tree.AdviseVisualTreeChange(callback.as_raw()).ok()?;
+                            protocol::trace("Bridge.Advised");
                             let status = WaitForMultipleObjects(
                                 &[process.raw(), stop.raw()],
                                 false,
@@ -426,7 +517,8 @@ impl IObjectWithSite_Impl for Site_Impl {
                             tree.UnadviseVisualTreeChange(callback.as_raw()).ok()?;
                             session.restore()
                         })();
-                        if result.is_err() {
+                        if let Err(error) = &result {
+                            session.status.fail(error.code());
                             let _ = SetEvent(session.failed.raw());
                             let _ = session.restore();
                         }
@@ -438,7 +530,9 @@ impl IObjectWithSite_Impl for Site_Impl {
             *self.site.lock().map_err(|_| Error::from(E_UNEXPECTED))? = Some(site.clone());
             Ok(())
         })();
-        if result.is_err() {
+        if let Err(error) = &result {
+            status.fail(error.code());
+            protocol::trace(&format!("Bridge.SetSite error={error}"));
             SESSION_ACTIVE.store(false, Ordering::Release);
         }
         result
@@ -500,6 +594,12 @@ pub unsafe extern "system" fn DllGetClassObject(
     if *class != protocol::BRIDGE_CLSID {
         return CLASS_E_CLASSNOTAVAILABLE;
     }
+    protocol::trace("Bridge.DllGetClassObject");
+    let status = match protocol::StatusChannel::open(GetCurrentProcessId()) {
+        Ok(status) => Arc::new(status),
+        Err(error) => return error.code(),
+    };
+    status.stage(1);
     let factory: IClassFactory = Factory.into();
     factory.query(iid, out)
 }
@@ -512,6 +612,22 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn late_frame_discovers_background_without_requiring_border() {
+        let mut tree = TreeState::default();
+        tree.nodes.insert(3, 2);
+        tree.pending.insert(3, true);
+        assert!(tree.candidates().is_empty());
+        tree.nodes.insert(2, 1);
+        tree.frames.insert(1);
+        assert_eq!(tree.candidates(), vec![(3, 1, true)]);
+        tree.targets.insert(3, (1, true));
+        assert!(tree.has_background());
+        assert!(tree.candidates().is_empty());
+        tree.frames.remove(&1);
+        assert!(!tree.has_background());
+    }
+
     #[test]
     fn xaml_abi_matches_windows_sdk_x64() {
         assert_eq!(std::mem::size_of::<Relation>(), 24);

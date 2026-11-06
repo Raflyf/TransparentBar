@@ -29,8 +29,9 @@ const EXIT: usize = 3;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
+mod icon;
 mod protocol;
-use protocol::{event_name, InitializeXaml, BRIDGE_CLSID};
+use protocol::{event_name, InitializeXaml, StatusChannel, BRIDGE_CLSID, BRIDGE_FILE};
 static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[repr(C)]
@@ -54,6 +55,7 @@ struct XamlSession {
     failed: HANDLE,
     stop: HANDLE,
     done: HANDLE,
+    status: StatusChannel,
 }
 impl XamlSession {
     fn connect(generation: u32) -> Result<Self> {
@@ -74,6 +76,12 @@ impl XamlSession {
                 failed: HANDLE::default(),
                 stop: HANDLE::default(),
                 done: HANDLE::default(),
+                status: StatusChannel::create(
+                    host,
+                    shell,
+                    generation,
+                    std::env::args().any(|arg| arg == "--diagnose"),
+                )?,
             };
             session.ready = create("Ready")?;
             session.failed = create("Failed")?;
@@ -88,16 +96,21 @@ impl XamlSession {
                 let address = GetProcAddress(module, s!("InitializeXamlDiagnosticsEx"))
                     .ok_or_else(Error::from_win32)?;
                 let initialize: InitializeXaml = std::mem::transmute(address);
-                let bridge = std::env::current_exe()?.with_file_name("transparentbar_bridge.dll");
+                let bridge = std::env::current_exe()?.with_file_name(BRIDGE_FILE);
                 if !bridge.is_file() {
                     return Err(Error::new(
                         E_FAIL,
-                        "transparentbar_bridge.dll harus di folder aplikasi.",
+                        format!("{BRIDGE_FILE} harus di folder aplikasi."),
                     ));
                 }
                 let bridge = wide(bridge.as_os_str());
                 let init = wide(std::ffi::OsStr::new(&format!(
-                    "{host}:{shell}:{generation}"
+                    "{host}:{shell}:{generation}{}",
+                    if std::env::args().any(|arg| arg == "--diagnose") {
+                        ";inspect"
+                    } else {
+                        ""
+                    }
                 )));
                 let endpoint = wide(std::ffi::OsStr::new(&format!(
                     "VisualDiagConnection{generation}"
@@ -111,6 +124,7 @@ impl XamlSession {
                     PCWSTR(init.as_ptr()),
                 )
                 .ok()
+                .inspect(|_| protocol::trace("Host.Initialize S_OK"))
             })();
             let _ = FreeLibrary(module);
             result?;
@@ -119,8 +133,17 @@ impl XamlSession {
     }
     fn ready(&self) -> Result<bool> {
         unsafe {
-            if WaitForSingleObject(self.failed, 0) == WAIT_OBJECT_0 {
-                return Err(Error::new(E_FAIL, "Bridge tidak dapat mengubah taskbar atau memulihkan tampilan. Tutup aplikasi dan laporkan error ini."));
+            let code = self.status.data().error.load(Ordering::Acquire);
+            if code < 0 || WaitForSingleObject(self.failed, 0) == WAIT_OBJECT_0 {
+                let code = if code < 0 {
+                    windows::core::HRESULT(code)
+                } else {
+                    E_FAIL
+                };
+                return Err(Error::new(
+                    code,
+                    format!("Bridge gagal: {}", self.status.describe()),
+                ));
             }
             Ok(WaitForSingleObject(self.ready, 0) == WAIT_OBJECT_0)
         }
@@ -352,7 +375,7 @@ Tutup aplikasi pengubah taskbar lain, lalu coba lagi."
     }
 }
 
-fn add_tray(hwnd: HWND) -> Result<()> {
+fn add_tray(hwnd: HWND, application_icon: HICON) -> Result<()> {
     unsafe {
         let mut icon = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -360,9 +383,7 @@ fn add_tray(hwnd: HWND) -> Result<()> {
             uID: 1,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
             uCallbackMessage: TRAY_MESSAGE,
-            hIcon: LoadIconW(None, IDI_APPLICATION).map_err(|error| {
-                Error::new(error.code(), format!("Memuat ikon Windows: {error}"))
-            })?,
+            hIcon: application_icon,
             ..Default::default()
         };
         let tip = wide(std::ffi::OsStr::new("TransparentBar - taskbar transparan"));
@@ -431,7 +452,7 @@ fn command(id: usize) -> Result<bool> {
         ABOUT => unsafe {
             MessageBoxW(
                 None,
-                w!("TransparentBar 0.1.0
+                w!("TransparentBar 0.1.1
 Native Rust, Windows 10 dan 11 x64.
 Copyright 2026 Rafly Firmansyah.
 MIT License; boleh dibagikan sesuai lisensi. Tanpa garansi.
@@ -505,10 +526,12 @@ fn run() -> Result<()> {
                 }
                 return Ok(());
             }
+            let application_icon = icon::AppIcon::load()?;
             let instance = HINSTANCE(GetModuleHandleW(None)?.0);
             let class = WNDCLASSW {
                 lpfnWndProc: Some(window_proc),
                 hInstance: instance,
+                hIcon: application_icon.0,
                 lpszClassName: WINDOW_CLASS,
                 ..Default::default()
             };
@@ -580,7 +603,7 @@ fn run() -> Result<()> {
                                 retries = 3;
                             }
                             if !tray_ready {
-                                match add_tray(hwnd) {
+                                match add_tray(hwnd, application_icon.0) {
                                     Ok(()) => tray_ready = true,
                                     Err(_) if retries > 0 => {
                                         retries -= 1;
@@ -607,7 +630,12 @@ fn run() -> Result<()> {
                             if let Some(service) = &mut service {
                                 if !service.apply()? {
                                     if readiness == 0 {
-                                        return Err(Error::new(E_FAIL, "Taskbar tidak merespons bridge. Versi shell mungkin berubah atau ada pengubah taskbar lain."));
+                                        let detail = service
+                                            .xaml
+                                            .as_ref()
+                                            .map(|session| session.status.describe())
+                                            .unwrap_or_default();
+                                        return Err(Error::new(E_FAIL, format!("Taskbar belum siap: {detail}. Log: %LOCALAPPDATA%\\TransparentBar\\startup.log")));
                                     }
                                     readiness -= 1;
                                     schedule(hwnd, 500)?;
@@ -668,16 +696,43 @@ fn run() -> Result<()> {
     }
 }
 
+fn diagnose() -> Result<()> {
+    protocol::trace("Host.Diagnose start");
+    let session = XamlSession::connect(2)?;
+    let start = std::time::Instant::now();
+    unsafe {
+        while start.elapsed() < std::time::Duration::from_secs(8) {
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            if session.ready()? {
+                protocol::trace("Host.Diagnose Ready");
+                break;
+            }
+            let _ = MsgWaitForMultipleObjects(None, false, 100, QS_ALLINPUT);
+        }
+    }
+    protocol::trace("Host.Diagnose stop");
+    session.restore()
+}
+
 fn main() {
+    protocol::trace("Host.Main");
     unsafe {
         if let Err(error) = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() {
             show_error(&error);
             std::process::exit(1);
         }
-        let result = run();
+        let diagnostic = std::env::args().any(|arg| arg == "--diagnose");
+        let result = if diagnostic { diagnose() } else { run() };
         CoUninitialize();
         if let Err(error) = result {
-            show_error(&error);
+            protocol::trace(&format!("Host.Error {error}"));
+            if !diagnostic {
+                show_error(&error);
+            }
             std::process::exit(1);
         }
     }

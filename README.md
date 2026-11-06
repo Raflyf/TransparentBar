@@ -1,6 +1,6 @@
 # TransparentBar
 
-Taskbar transparan untuk Windows 10 dan Windows 11 x64. EXE dan bridge DLL dibuat native Rust. Tanpa browser runtime, blur, logger, telemetry, atau polling terus-menerus.
+Taskbar transparan untuk Windows 10 dan Windows 11 x64. EXE dan bridge DLL dibuat native Rust. Tanpa browser runtime, blur, telemetry, atau polling terus-menerus. Trace startup kecil hanya dipakai saat inisialisasi/error.
 
 ## Download
 
@@ -15,13 +15,25 @@ Ambil **TransparentBar-setup.exe** untuk instalasi, atau **TransparentBar-window
 ### Portable
 
 1. Ekstrak seluruh ZIP ke folder tetap.
-2. Jalankan `transparentbar.exe`. `transparentbar_bridge.dll` harus di folder yang sama.
+2. Jalankan `transparentbar.exe`. `transparentbar_bridge-0.1.1.dll` harus di folder yang sama. Versi DLL diberi nama terpisah supaya update tidak memakai image lama yang masih dimuat Explorer.
 
 ### Pengaturan
 
 Klik ikon TransparentBar di tray dekat jam; buka menu ikon tambahan bila tersembunyi. Menu native mendukung keyboard. Centang **Jalankan saat login** untuk startup; hilangkan centang untuk mematikannya. **Keluar** memulihkan taskbar lalu menghentikan aplikasi. Membuka EXE lagi membuka menu instance yang ada.
 
 Startup hanya memakai nilai **TransparentBar** pada `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Folder ber-spasi/Unicode didukung; batas command Windows 260 karakter. Bila lokasi portable pindah, matikan lalu aktifkan startup dari lokasi baru. Task Manager dapat menonaktifkan startup secara terpisah.
+
+## Patch 0.1.1: timeout bridge dan ikon
+
+Ikon multiukuran sekarang berada dalam EXE, tray, dan setup; bukan ikon aplikasi Windows bawaan. Startup bridge menerima CoreDispatcher maupun DispatcherQueue, BackgroundStroke tidak lagi syarat Ready, dan BackgroundFill dikonfirmasi melalui readback opacity 0. Kandidat yang datang sebelum frame induk direevaluasi.
+
+Error awal COM/QI kini memiliki channel status sebelum SetSite. Jika masih gagal, pesan menyebut tahap dan jumlah callback/frame/fill/border, bukan otomatis menyalahkan aplikasi lain. Trace startup ada di %LOCALAPPDATA%\TransparentBar\startup.log. Mode pemeriksaan tanpa perubahan opacity:
+
+```powershell
+.\transparentbar.exe --diagnose
+```
+
+Build/tes patch bukan bukti runtime pada semua Windows. Probe di runner ditolak sebelum akses desktop; keberhasilan transparansi patch perlu diuji pada desktop pengguna.
 
 ## Kompatibilitas dan pemulihan
 

@@ -1,6 +1,6 @@
 [package]
 name = "transparentbar"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Taskbar transparan Windows, dengan startup opsional"
@@ -16,12 +16,14 @@ windows = { version = "=0.58.0", default-features = false, features = [
     "implement",
     "Foundation",
     "UI_Core",
+    "System",
     "Win32_System_Ole",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
+    "Win32_System_Memory",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_Accessibility",
