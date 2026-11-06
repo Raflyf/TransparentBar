@@ -38,6 +38,10 @@ unsafe trait ITreeCallback: IUnknown {
         mutation: i32,
     ) -> HRESULT;
 }
+#[interface("BAD9EB88-AE77-4397-B948-5FA2DB0A19EA")]
+unsafe trait ITreeCallback2: ITreeCallback {
+    fn OnElementStateChanged(&self, element: u64, state: i32, context: PCWSTR) -> HRESULT;
+}
 #[interface("A593B11A-D17F-48BB-8F66-83910731C8A5")]
 unsafe trait ITreeService: IUnknown {
     fn AdviseVisualTreeChange(&self, callback: *mut c_void) -> HRESULT;
@@ -81,7 +85,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
 };
@@ -143,9 +147,36 @@ impl UiDispatcher {
 }
 
 #[derive(Clone)]
+struct OwnerState {
+    dispatcher: UiDispatcher,
+    ready: bool,
+}
+
+struct RestoreCompletion {
+    remaining: AtomicUsize,
+    failed: AtomicBool,
+}
+impl RestoreCompletion {
+    fn new(count: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(count),
+            failed: AtomicBool::new(false),
+        }
+    }
+    fn finish(&self, success: bool) -> bool {
+        if !success {
+            self.failed.store(true, Ordering::Release);
+        }
+        self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 && !self.failed.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone)]
 struct Session {
     diagnostics: AgileReference<IXamlDiagnostics>,
-    dispatcher: UiDispatcher,
+    fallback_dispatcher: UiDispatcher,
+    owners: Arc<Mutex<HashMap<u32, OwnerState>>>,
+    restoring: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
     ready: Arc<OwnedHandle>,
     failed: Arc<OwnedHandle>,
@@ -202,23 +233,63 @@ impl TreeState {
     }
 }
 
-fn queue(session: &Session, action: impl Fn() -> Result<()> + Send + 'static) -> Result<()> {
-    let failed = session.failed.clone();
-    let status = session.status.clone();
-    session.dispatcher.enqueue(move || {
-        let result = action();
-        if let Err(error) = &result {
-            status.fail(error.code());
-            unsafe {
-                let _ = SetEvent(failed.raw());
+impl Session {
+    fn owner_dispatcher(&self) -> Result<Option<(u32, UiDispatcher)>> {
+        let thread = unsafe { GetCurrentThreadId() };
+        {
+            let owners = self.owners.lock().map_err(|_| Error::from(E_UNEXPECTED))?;
+            if !self.active.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            if let Some(owner) = owners.get(&thread) {
+                return Ok(Some((thread, owner.dispatcher.clone())));
             }
         }
-        result
-    })?;
-    Ok(())
-}
+        let dispatcher = match DispatcherQueue::GetForCurrentThread() {
+            Ok(queue) if queue.HasThreadAccess()? => UiDispatcher::Queue(queue),
+            _ if self.fallback_dispatcher.has_thread_access()? => self.fallback_dispatcher.clone(),
+            _ => {
+                return Err(Error::new(
+                    RPC_E_WRONG_THREAD,
+                    "Callback XAML bukan pada UI thread pemilik.",
+                ))
+            }
+        };
+        let mut owners = self.owners.lock().map_err(|_| Error::from(E_UNEXPECTED))?;
+        if !self.active.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        owners.insert(
+            thread,
+            OwnerState {
+                dispatcher: dispatcher.clone(),
+                ready: false,
+            },
+        );
+        protocol::trace(&format!("Bridge.Owner thread={thread}"));
+        Ok(Some((thread, dispatcher)))
+    }
 
-impl Session {
+    fn update_ready(&self, thread: u32, ready: bool) -> Result<()> {
+        let mut owners = self.owners.lock().map_err(|_| Error::from(E_UNEXPECTED))?;
+        if !self.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(owner) = owners.get_mut(&thread) {
+            owner.ready = ready;
+        }
+        let any_ready = owners.values().any(|owner| owner.ready);
+        unsafe {
+            if any_ready {
+                self.status.stage(10);
+                SetEvent(self.ready.raw())?;
+            } else {
+                ResetEvent(self.ready.raw())?;
+            }
+        }
+        Ok(())
+    }
+
     fn mutation(
         &self,
         relation: Relation,
@@ -230,8 +301,14 @@ impl Session {
         if !self.active.load(Ordering::Acquire) {
             return Ok(());
         }
-        let this = self.clone();
-        let action = move || {
+        let Some((thread, dispatcher)) = self.owner_dispatcher()? else {
+            return Ok(());
+        };
+        if !dispatcher.has_thread_access()? {
+            return Err(Error::from(RPC_E_WRONG_THREAD));
+        }
+        let this = self;
+        let action = || {
             if !this.active.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -311,67 +388,101 @@ impl Session {
                         this.status.data().borders.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                if tree.borrow().has_background() {
-                    this.status.stage(10);
-                    unsafe {
-                        SetEvent(this.ready.raw())?;
-                    }
-                } else {
-                    unsafe {
-                        ResetEvent(this.ready.raw())?;
-                    }
-                }
+                this.update_ready(thread, tree.borrow().has_background())?;
                 Ok(())
             })
         };
-        if self.dispatcher.has_thread_access()? {
-            action()
-        } else {
-            queue(self, action)
-        }
+        action()
     }
 
     fn restore(&self) -> Result<()> {
+        if self.restoring.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
         self.active.store(false, Ordering::Release);
         self.status.stage(11);
-        let status = self.status.clone();
-        let done = self.done.clone();
-        queue(self, move || {
-            let saved = TREE.with(|tree| std::mem::take(&mut tree.borrow_mut().saved));
-            let mut failed = HashMap::new();
-            let mut failure = None;
-            for (handle, (element, opacity)) in saved {
-                if let Err(error) =
-                    unsafe { (element.vtable().SetOpacity)(element.as_raw(), opacity).ok() }
-                {
-                    failure = Some(error);
-                    failed.insert(handle, (element, opacity));
-                }
-            }
-            TREE.with(|tree| {
-                if failed.is_empty() {
-                    *tree.borrow_mut() = TreeState::default();
-                } else {
-                    tree.borrow_mut().saved = failed;
-                }
-            });
-            if let Some(error) = failure {
-                return Err(error);
-            }
+        let owners: Vec<_> = self
+            .owners
+            .lock()
+            .map_err(|_| Error::from(E_UNEXPECTED))?
+            .iter()
+            .map(|(thread, owner)| (*thread, owner.dispatcher.clone()))
+            .collect();
+        if owners.is_empty() {
             SESSION_ACTIVE.store(false, Ordering::Release);
-            status.stage(12);
-            unsafe {
-                SetEvent(done.raw())?;
+            self.status.stage(12);
+            return unsafe { SetEvent(self.done.raw()) };
+        }
+        let completion = Arc::new(RestoreCompletion::new(owners.len()));
+        for (thread, dispatcher) in owners {
+            let session = self.clone();
+            let remaining = completion.clone();
+            let owner = dispatcher.clone();
+            let action = move || {
+                let result = (|| -> Result<()> {
+                    if unsafe { GetCurrentThreadId() } != thread || !owner.has_thread_access()? {
+                        return Err(Error::from(RPC_E_WRONG_THREAD));
+                    }
+                    let saved = TREE.with(|tree| std::mem::take(&mut tree.borrow_mut().saved));
+                    let mut failed = HashMap::new();
+                    let mut failure = None;
+                    for (handle, (element, opacity)) in saved {
+                        if let Err(error) =
+                            unsafe { (element.vtable().SetOpacity)(element.as_raw(), opacity).ok() }
+                        {
+                            failure = Some(error);
+                            failed.insert(handle, (element, opacity));
+                        }
+                    }
+                    TREE.with(|tree| {
+                        if failed.is_empty() {
+                            *tree.borrow_mut() = TreeState::default();
+                        } else {
+                            tree.borrow_mut().saved = failed;
+                        }
+                    });
+                    if let Some(error) = failure {
+                        return Err(error);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = &result {
+                    session.status.fail(error.code());
+                    unsafe {
+                        let _ = SetEvent(session.failed.raw());
+                    }
+                }
+                if remaining.finish(result.is_ok()) {
+                    SESSION_ACTIVE.store(false, Ordering::Release);
+                    session.status.stage(12);
+                    unsafe {
+                        SetEvent(session.done.raw())?;
+                    }
+                }
+                result
+            };
+            if let Err(error) = dispatcher.enqueue(action) {
+                completion.finish(false);
+                self.status.fail(error.code());
+                unsafe {
+                    let _ = SetEvent(self.failed.raw());
+                }
             }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 }
 
-#[implement(ITreeCallback)]
+#[implement(ITreeCallback2)]
 struct Watcher {
     session: Session,
 }
+impl ITreeCallback2_Impl for Watcher_Impl {
+    unsafe fn OnElementStateChanged(&self, _: u64, _: i32, _: PCWSTR) -> HRESULT {
+        S_OK
+    }
+}
+
 impl ITreeCallback_Impl for Watcher_Impl {
     unsafe fn OnVisualTreeChange(
         &self,
@@ -402,8 +513,8 @@ impl ITreeCallback_Impl for Watcher_Impl {
             || matches!(name.as_str(), "BackgroundFill" | "BackgroundStroke")
         {
             protocol::trace(&format!(
-                "Bridge.Target handle={} parent={} type={kind} name={name} mutation={mutation}",
-                element.handle, relation.parent
+                "Bridge.Target handle={} parent={} thread={} type={kind} name={name} mutation={mutation}",
+                element.handle, relation.parent, GetCurrentThreadId()
             ));
         }
         let result = self
@@ -474,7 +585,9 @@ impl IObjectWithSite_Impl for Site_Impl {
             ));
             let session = Session {
                 diagnostics: AgileReference::new(&diagnostics)?,
-                dispatcher,
+                fallback_dispatcher: dispatcher,
+                owners: Arc::new(Mutex::new(HashMap::new())),
+                restoring: Arc::new(AtomicBool::new(false)),
                 active: Arc::new(AtomicBool::new(true)),
                 inspect,
                 status: status.clone(),
@@ -483,10 +596,11 @@ impl IObjectWithSite_Impl for Site_Impl {
                 failed,
                 done,
             };
-            let callback: ITreeCallback = Watcher {
+            let callback: ITreeCallback2 = Watcher {
                 session: session.clone(),
             }
             .into();
+            let callback: ITreeCallback = callback.cast()?;
             let tree = AgileReference::new(&tree)?;
             let callback = AgileReference::new(&callback)?;
             std::thread::Builder::new()
@@ -612,6 +726,56 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restore_waits_for_every_owner_and_never_hides_failure() {
+        let completion = RestoreCompletion::new(2);
+        assert!(!completion.finish(true));
+        assert!(completion.finish(true));
+        let completion = RestoreCompletion::new(2);
+        assert!(!completion.finish(false));
+        assert!(!completion.finish(true));
+    }
+
+    #[test]
+    fn callback_threads_keep_separate_visual_trees() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = [10u64, 20]
+            .into_iter()
+            .map(|frame| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    TREE.with(|tree| {
+                        let mut tree = tree.borrow_mut();
+                        tree.frames.insert(frame);
+                        tree.nodes.insert(frame + 1, frame);
+                        tree.pending.insert(frame + 1, true);
+                    });
+                    barrier.wait();
+                    TREE.with(|tree| {
+                        assert_eq!(tree.borrow().candidates(), vec![(frame + 1, frame, true)])
+                    });
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn watcher_supports_multi_window_callback_contract() {
+        fn requires_v2<T: ITreeCallback2_Impl>() {}
+        requires_v2::<Watcher_Impl>();
+        assert_eq!(
+            ITreeCallback2::IID,
+            GUID::from_u128(0xbad9eb88_ae77_4397_b948_5fa2db0a19ea)
+        );
+        assert_eq!(
+            std::mem::offset_of!(ITreeCallback2_Vtbl, OnElementStateChanged),
+            4 * 8
+        );
+    }
+
     #[test]
     fn late_frame_discovers_background_without_requiring_border() {
         let mut tree = TreeState::default();

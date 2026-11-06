@@ -5,8 +5,8 @@ use windows::{
 };
 
 #[allow(dead_code)]
-pub const BRIDGE_FILE: &str = "transparentbar_bridge-0.1.1.dll";
-pub const BRIDGE_CLSID: GUID = GUID::from_u128(0xa4eb8c67_775c_4e85_a781_a98c3a4b5752);
+pub const BRIDGE_FILE: &str = "transparentbar_bridge-0.1.2.dll";
+pub const BRIDGE_CLSID: GUID = GUID::from_u128(0xf4fd55c8_1b61_4a99_943f_03bafc54a188);
 #[allow(dead_code)]
 pub type InitializeXaml =
     unsafe extern "system" fn(PCWSTR, u32, PCWSTR, PCWSTR, GUID, PCWSTR) -> HRESULT;
@@ -18,7 +18,7 @@ pub fn event_name(host: u32, shell: u32, generation: u32, kind: &str) -> Vec<u16
         .collect()
 }
 fn status_name(shell: u32) -> Vec<u16> {
-    format!(r"Local\TransparentBar.0.1.1.Status.{shell}")
+    format!(r"Local\TransparentBar.0.1.2.Status.{shell}")
         .encode_utf16()
         .chain([0])
         .collect()
