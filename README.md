@@ -125,7 +125,7 @@ The project focuses on taskbar transparency and low background overhead. Discuss
 
 ### Release policy
 
-Release versions change only when new user-facing features are added. Bug fixes, design updates, and other maintenance keep the current version; the commit SHA and CI run identify each build. Portable packages include `BUILD.txt` with the version and source commit.
+New features and bug fixes receive a new release version. Bug-fix releases increment the patch version. Design-only updates, documentation, and other maintenance keep the current version; the commit SHA and CI run identify each build. Portable packages include `BUILD.txt` with the version and source commit.
 
 ## License
 

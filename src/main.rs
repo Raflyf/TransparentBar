@@ -27,6 +27,7 @@ const STARTUP: usize = 1;
 const ABOUT: usize = 2;
 const EXIT: usize = 3;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
+const REFRESH_TIMER_ID: usize = 1;
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 mod icon;
@@ -438,8 +439,15 @@ fn is_tray_menu(notification: u32) -> bool {
     )
 }
 
+fn is_refresh_timer(hwnd: HWND, message: &MSG) -> bool {
+    message.message == WM_TIMER
+        && message.hwnd == hwnd
+        && message.wParam.0 == REFRESH_TIMER_ID
+        && message.lParam.0 == 0
+}
+
 fn schedule(hwnd: HWND, delay_ms: u32) -> Result<()> {
-    if unsafe { SetTimer(hwnd, 1, delay_ms, None) } == 0 {
+    if unsafe { SetTimer(hwnd, REFRESH_TIMER_ID, delay_ms, None) } == 0 {
         Err(Error::from_win32())
     } else {
         Ok(())
@@ -452,7 +460,7 @@ fn command(id: usize) -> Result<bool> {
         ABOUT => unsafe {
             MessageBoxW(
                 None,
-                w!("TransparentBar 0.1.2
+                w!("TransparentBar 0.1.4
 Native Rust, Windows 10 dan 11 x64.
 Copyright 2026 Rafly Firmansyah.
 MIT License; boleh dibagikan sesuai lisensi. Tanpa garansi.
@@ -472,7 +480,7 @@ Pengaturan startup berlaku untuk akun Windows ini saja."),
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if message == TASKBAR_CREATED.load(Ordering::Relaxed) && message != 0 {
         RESTART.store(true, Ordering::Release);
-        SetTimer(hwnd, 1, 1000, None);
+        SetTimer(hwnd, REFRESH_TIMER_ID, 1000, None);
         return LRESULT(0);
     }
     match message {
@@ -485,7 +493,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             LRESULT(0)
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_THEMECHANGED => {
-            SetTimer(hwnd, 1, 500, None);
+            SetTimer(hwnd, REFRESH_TIMER_ID, 500, None);
             LRESULT(0)
         }
         WM_CLOSE => {
@@ -511,7 +519,7 @@ unsafe extern "system" fn foreground_changed(
     _: u32,
 ) {
     if let Ok(hwnd) = FindWindowW(WINDOW_CLASS, None) {
-        SetTimer(hwnd, 1, 100, None);
+        SetTimer(hwnd, REFRESH_TIMER_ID, 100, None);
     }
 }
 
@@ -593,8 +601,9 @@ fn run() -> Result<()> {
                         REFRESH_MESSAGE => {
                             schedule(hwnd, 500)?;
                         }
-                        WM_TIMER => {
-                            KillTimer(hwnd, 1)?;
+                        WM_TIMER if is_refresh_timer(hwnd, &msg) => {
+                            // KillTimer leaves queued ticks behind; an already-removed timer is harmless.
+                            let _ = KillTimer(hwnd, REFRESH_TIMER_ID);
                             if RESTART.swap(false, Ordering::AcqRel) {
                                 service = None;
                                 generation += 1;
@@ -748,6 +757,45 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_timer_does_not_consume_menu_or_callback_timers() {
+        let window = HWND(0x100usize as *mut c_void);
+        let own = MSG {
+            hwnd: window,
+            message: WM_TIMER,
+            wParam: WPARAM(REFRESH_TIMER_ID),
+            ..Default::default()
+        };
+        assert!(is_refresh_timer(window, &own));
+        for foreign in [
+            MSG {
+                hwnd: HWND::default(),
+                ..own
+            },
+            MSG {
+                hwnd: HWND(0x200usize as *mut c_void),
+                ..own
+            },
+            MSG {
+                wParam: WPARAM(REFRESH_TIMER_ID + 1),
+                ..own
+            },
+            MSG {
+                lParam: LPARAM(1),
+                ..own
+            },
+            MSG {
+                message: WM_COMMAND,
+                ..own
+            },
+        ] {
+            assert!(
+                !is_refresh_timer(window, &foreign),
+                "foreign timer was consumed"
+            );
+        }
+    }
 
     #[test]
     fn startup_quotes_path_and_preserves_unicode() {
