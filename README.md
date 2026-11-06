@@ -1,67 +1,128 @@
-# TransparentBar
+<p align="center">
+  <a href="https://github.com/Raflyf/transparentbar">
+    <img src="https://raw.githubusercontent.com/Raflyf/transparentbar/main/assets/transparentbar.png" width="88" height="88" alt="TransparentBar logo">
+  </a>
+</p>
 
-Taskbar transparan untuk Windows 10 dan Windows 11 x64. EXE dan bridge DLL dibuat native Rust. Tanpa browser runtime, blur, telemetry, atau polling terus-menerus. Trace startup kecil hanya dipakai saat inisialisasi/error.
+<h1 align="center">TransparentBar</h1>
+
+<p align="center">Native taskbar transparency for Windows. Built with Rust.</p>
+
+<p align="center">
+  <a href="https://github.com/Raflyf/transparentbar/actions/workflows/build.yml"><img src="https://github.com/Raflyf/transparentbar/actions/workflows/build.yml/badge.svg" alt="Windows build status"></a>
+  <a href="https://github.com/Raflyf/transparentbar/releases/latest"><img src="https://img.shields.io/github/v/release/Raflyf/transparentbar?color=24b8a8" alt="Latest release"></a>
+  <a href="https://github.com/Raflyf/transparentbar/blob/main/LICENSE.md"><img src="https://img.shields.io/github/license/Raflyf/transparentbar" alt="MIT license"></a>
+</p>
+
+<p align="center">
+  <a href="#download">Download</a> ·
+  <a href="#getting-started">Getting started</a> ·
+  <a href="#compatibility">Compatibility</a> ·
+  <a href="#building-from-source">Build</a> ·
+  <a href="#contributing">Contribute</a>
+</p>
+
+TransparentBar removes the taskbar background while keeping your Windows icons and controls in place. It runs in the system tray, with optional startup at sign-in and a native menu for the settings you need.
+
+## Features
+
+- **Transparent taskbar.** A clear background without blur or color effects.
+- **Native Rust.** No webview, browser engine, or bundled UI framework.
+- **Event-driven.** Responds to Windows events instead of continuously polling the desktop.
+- **Optional startup.** Enable or disable launch at sign-in from the tray menu. Off by default.
+- **Installer or portable.** Install for your account, or extract a ZIP and run it.
+- **Local only.** No accounts, telemetry, or network requests from the application.
 
 ## Download
 
-Ambil **TransparentBar-setup.exe** untuk instalasi, atau **TransparentBar-windows-x64.zip** untuk portable, dari [Releases](https://github.com/Raflyf/transparentbar/releases/latest). Build tiap push tersedia di [Actions](https://github.com/Raflyf/transparentbar/actions).
+| Package | Best for |
+| --- | --- |
+| [Windows installer](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-setup.exe) | Start Menu integration and a standard uninstall entry |
+| [Portable ZIP](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-windows-x64.zip) | Running without installation |
 
-### Setup
+**Requires Windows 10 or Windows 11 on an x64 PC.** No administrator access is required for normal use. ARM64 is not supported.
 
-1. Jalankan installer; instalasi berlaku untuk akun Windows aktif tanpa administrator.
-2. Opsi **Jalankan saat login** tersedia di installer; default mati.
-3. Buka TransparentBar dari Start Menu.
+Browse [all releases](https://github.com/Raflyf/transparentbar/releases) for earlier versions and release notes. Development builds are available in [GitHub Actions](https://github.com/Raflyf/transparentbar/actions).
 
-### Portable
+## Getting started
 
-1. Ekstrak seluruh ZIP ke folder tetap.
-2. Jalankan `transparentbar.exe`. `transparentbar_bridge-0.1.1.dll` harus di folder yang sama. Versi DLL diberi nama terpisah supaya update tidak memakai image lama yang masih dimuat Explorer.
+1. Download the installer or extract the entire portable ZIP to a permanent folder.
+2. Close any other taskbar customization tools, then open TransparentBar.
+3. Click its icon in the system tray near the clock. If hidden, open the tray overflow menu.
 
-### Pengaturan
+| Tray option | Action |
+| --- | --- |
+| **Jalankan saat login** | Toggle startup at Windows sign-in |
+| **Tentang / lisensi** | View version and license information |
+| **Keluar** | Restore the saved appearance and exit |
 
-Klik ikon TransparentBar di tray dekat jam; buka menu ikon tambahan bila tersembunyi. Menu native mendukung keyboard. Centang **Jalankan saat login** untuk startup; hilangkan centang untuk mematikannya. **Keluar** memulihkan taskbar lalu menghentikan aplikasi. Membuka EXE lagi membuka menu instance yang ada.
+The tray menu currently uses Indonesian labels and supports keyboard navigation. Opening the application again opens the existing instance's menu.
 
-Startup hanya memakai nilai **TransparentBar** pada `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Folder ber-spasi/Unicode didukung; batas command Windows 260 karakter. Bila lokasi portable pindah, matikan lalu aktifkan startup dari lokasi baru. Task Manager dapat menonaktifkan startup secara terpisah.
+For portable use, keep the executable and its versioned bridge DLL together. If you move the folder after enabling startup, disable and re-enable startup from the new location.
 
-## Patch 0.1.1: timeout bridge dan ikon
+## Compatibility
 
-Ikon multiukuran sekarang berada dalam EXE, tray, dan setup; bukan ikon aplikasi Windows bawaan. Startup bridge menerima CoreDispatcher maupun DispatcherQueue, BackgroundStroke tidak lagi syarat Ready, dan BackgroundFill dikonfirmasi melalui readback opacity 0. Kandidat yang datang sebelum frame induk direevaluasi.
+TransparentBar detects the taskbar implementation rather than relying on a fixed Windows build number. It includes separate paths for legacy and XAML taskbars, with UI-thread handling for XAML windows.
 
-Error awal COM/QI kini memiliki channel status sebelum SetSite. Jika masih gagal, pesan menyebut tahap dan jumlah callback/frame/fill/border, bukan otomatis menyalahkan aplikasi lain. Trace startup ada di %LOCALAPPDATA%\TransparentBar\startup.log. Mode pemeriksaan tanpa perubahan opacity:
+This is an **early release**. Windows updates can change taskbar behavior; compatibility with every Windows build or third-party shell is not guaranteed. Multi-monitor behavior needs validation on the Windows version you use. If a taskbar update breaks transparency, please [report the issue](https://github.com/Raflyf/transparentbar/issues/new).
+
+<details>
+<summary><strong>Windows security warnings</strong></summary>
+
+Current release binaries are unsigned. Windows may show an unknown-publisher or SmartScreen warning. Download only from this repository's Releases page, and follow your organization's security policy. Do not disable antivirus or Windows protection to run the application.
+
+The build pipeline supports Authenticode signing when the maintainer provides a trusted code-signing certificate. A self-signed certificate does not establish public trust.
+
+</details>
+
+<details>
+<summary><strong>Taskbar restoration and updates</strong></summary>
+
+Choose **Keluar** to restore the saved taskbar appearance before closing. The XAML bridge also watches for the host process to exit. If Windows rejects restoration, the application reports an error rather than discarding the saved state.
+
+Windows keeps the XAML bridge loaded in Explorer for the remainder of that Explorer session. A versioned DLL allows application updates without overwriting the loaded image. TransparentBar does not replace Windows system files.
+
+</details>
+
+## Troubleshooting
+
+If transparency does not activate, include the following in an [issue](https://github.com/Raflyf/transparentbar/issues/new):
+
+- TransparentBar version and whether you used the installer or portable package.
+- Windows version and build number from `winver`.
+- The complete error message or a screenshot.
+- Monitor count and any taskbar customization tools in use.
+
+Startup diagnostics are saved to `%LOCALAPPDATA%\TransparentBar\startup.log`. Review the file before sharing it. For a diagnostic run that inspects XAML elements without changing their opacity, run from the application folder:
 
 ```powershell
 .\transparentbar.exe --diagnose
 ```
 
-Build/tes patch bukan bukti runtime pada semua Windows. Probe di runner ditolak sebelum akses desktop; keberhasilan transparansi patch perlu diuji pada desktop pengguna.
+## Building from source
 
-## Kompatibilitas dan pemulihan
-
-Deteksi struktur taskbar, bukan daftar build: legacy memakai composition attribute; XAML memakai Windows XAML Diagnostics dengan bridge Rust. Tidak ada pembatasan ke satu build Windows 11. Primary taskbar XAML memakai dispatcher pemilik, menyimpan opacity asli, mengembalikan saat keluar/proses host mati. Taskbar legacy di monitor tambahan ikut diproses. Explorer restart dikenali dan sambungan dibangun ulang.
-
-API shell bukan kontrak stabil untuk semua update Windows. Build masa depan, termasuk 26H2, tidak dapat dijamin sebelum diuji. Shell pihak ketiga, ARM64, serta XAML multi-monitor dengan dispatcher terpisah perlu pengujian/adapter tersendiri. Unsupported taskbar memberi error, bukan klaim sukses palsu. Jangan menjalankan bersamaan dengan pengubah taskbar lain.
-
-Bridge dimuat dalam Explorer sampai Explorer berakhir. Tidak mengganti file Windows. Pemulihan XAML menjaga nilai opacity asli; binding/style lain di luar cakupan. Jika Windows menolak pemulihan, backup nilai ditahan dan sesi terkunci sampai Explorer restart agar perubahan baru tidak menimpa backup. Jika Windows menolak akses atau taskbar berubah, aplikasi memberi error; jangan matikan antivirus atau menjalankan sebagai administrator sebagai solusi default.
-
-Idle memakai blocking Windows message wait. Timer dipakai sementara untuk kesiapan awal dan event refresh, bukan loop polling permanen. RAM/CPU belum dibenchmark; tidak ada angka perkiraan sebagai klaim. Pengguna menguji instalasi, transparansi, login, dan monitor nyata.
-
-## Build
-
-Rust stable Windows x64; bindings Windows dipin versi kompatibel GNU/MSVC yang tersedia.
+Use Rust stable with the **x86_64-pc-windows-msvc** toolchain, Visual Studio C++ build tools, and the Windows SDK. The SDK resource compiler embeds the application icon and version information.
 
 ```powershell
+git clone https://github.com/Raflyf/transparentbar.git
+cd transparentbar
 cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
 .\build.ps1 -SkipBuild
 ```
 
-GitHub Actions menjalankan format, Clippy, tes, build MSVC dengan CRT statis, package ZIP, dan compiler Inno Setup. Tag `v*` menerbitkan ZIP dan setup di Releases. Compiler installer hanya dependency build; tidak berjalan saat aplikasi dipakai.
+The portable package is created in `dist\TransparentBar-windows-x64.zip`. To build the installer, install Inno Setup and compile [setup.iss](https://github.com/Raflyf/transparentbar/blob/main/setup.iss). GitHub Actions builds both packages; version tags publish them to Releases.
 
-## Digital signing
+GNU toolchain builds are available for development, but the release pipeline uses MSVC to embed Windows executable resources.
 
-Pipeline Authenticode tersedia melalui repo secrets **WINDOWS_CERTIFICATE_BASE64** (PFX code-signing resmi) dan **WINDOWS_CERTIFICATE_PASSWORD**. Sertifikat ditimestamp SHA-256 dan diverifikasi dengan `signtool verify /pa`. Jangan commit PFX/private key ke repo. Tanpa sertifikat resmi, build tetap unsigned dan Windows dapat memperingatkan penerbit tidak dikenal. Self-signed bukan pengganti trust publik; tanda tangan juga tidak menjamin bebas peringatan SmartScreen.
+## Contributing
 
-## Lisensi
+Bug reports, compatibility results, and focused pull requests are welcome. Check [existing issues](https://github.com/Raflyf/transparentbar/issues) before opening a new one, keep changes scoped, and run formatting, Clippy, and tests before submitting a pull request.
 
-[MIT License](<LICENSE.md>). Source host dan bridge tersedia di repo; tidak memuat komponen biner aplikasi referensi. API definitions mengikuti [Windows SDK XAML Diagnostics](https://learn.microsoft.com/en-us/windows/win32/api/xamlom/) dan [IUIElement](https://learn.microsoft.com/en-us/uwp/api/windows.ui.xaml.uielement.opacity).
+The project focuses on taskbar transparency and low background overhead. Discuss new features in an issue before adding UI frameworks or runtime dependencies.
+
+## License
+
+[MIT](https://github.com/Raflyf/transparentbar/blob/main/LICENSE.md) © Rafly Firmansyah.
