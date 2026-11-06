@@ -16,6 +16,8 @@
 
 <p align="center">
   <a href="#download">Download</a> ·
+  <a href="#preview">Preview</a> ·
+  <a href="#resource-use">Resource use</a> ·
   <a href="#getting-started">Getting started</a> ·
   <a href="#compatibility">Compatibility</a> ·
   <a href="#building-from-source">Build</a> ·
@@ -23,6 +25,12 @@
 </p>
 
 TransparentBar removes the taskbar background while keeping your Windows icons and controls in place. It runs in the system tray, with optional startup at sign-in and a native menu for the settings you need.
+
+## Preview
+
+Your wallpaper stays visible behind pinned apps and system controls. This framed preview uses a real Windows 11 desktop screenshot, with the taskbar detail enlarged from the same capture.
+
+![TransparentBar on a Windows 11 desktop, shown in a presentation frame with an enlarged taskbar detail](<https://raw.githubusercontent.com/Raflyf/TransparentBar/main/assets/desktop-preview.png>)
 
 ## Features
 
@@ -32,6 +40,18 @@ TransparentBar removes the taskbar background while keeping your Windows icons a
 - **Optional startup.** Enable or disable launch at sign-in from the tray menu. Off by default.
 - **Installer or portable.** Install for your account, or extract a ZIP and run it.
 - **Local only.** No accounts, telemetry, or network requests from the application.
+
+## Resource use
+
+A user-shared Task Manager capture shows **1.6 MB of memory** for the TransparentBar host process. The annotated view below highlights the application row while keeping the surrounding context visible.
+
+| Memory | CPU | Disk | Network |
+| --- | --- | --- | --- |
+| **1.6 MB** | **0%** | **0 MB/s** | **0 Mbps** |
+
+![Annotated Task Manager capture highlighting TransparentBar: 1.6 MB memory, 0 percent CPU, 0 MB per second disk, and 0 Mbps network at capture time](<https://raw.githubusercontent.com/Raflyf/TransparentBar/main/assets/resource-usage-card.png>)
+
+These are displayed values at capture time, not a benchmark or an upper limit. CPU is rounded by Task Manager. Usage varies with Windows version and activity; the highlighted row covers the host process, not the bridge loaded inside Explorer. The frame, callout, and labels are presentation additions; the screenshot values are unchanged.
 
 ## Download
 
