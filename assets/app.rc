@@ -1,8 +1,8 @@
 1 ICON "transparentbar.ico"
 
 1 VERSIONINFO
-FILEVERSION 0,1,2,0
-PRODUCTVERSION 0,1,2,0
+FILEVERSION 0,1,3,0
+PRODUCTVERSION 0,1,3,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0
 FILEOS 0x40004L
@@ -14,11 +14,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Rafly Firmansyah\0"
       VALUE "FileDescription", "TransparentBar\0"
-      VALUE "FileVersion", "0.1.2\0"
+      VALUE "FileVersion", "0.1.3\0"
       VALUE "InternalName", "transparentbar\0"
       VALUE "OriginalFilename", "transparentbar.exe\0"
       VALUE "ProductName", "TransparentBar\0"
-      VALUE "ProductVersion", "0.1.2\0"
+      VALUE "ProductVersion", "0.1.3\0"
     END
   END
   BLOCK "VarFileInfo"
