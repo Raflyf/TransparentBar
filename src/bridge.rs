@@ -157,10 +157,10 @@ struct RestoreCompletion {
     failed: AtomicBool,
 }
 impl RestoreCompletion {
-    fn new(count: usize) -> Self {
+    fn new(count: usize, subscription_removed: bool) -> Self {
         Self {
             remaining: AtomicUsize::new(count),
-            failed: AtomicBool::new(false),
+            failed: AtomicBool::new(!subscription_removed),
         }
     }
     fn finish(&self, success: bool) -> bool {
@@ -395,7 +395,7 @@ impl Session {
         action()
     }
 
-    fn restore(&self) -> Result<()> {
+    fn restore(&self, subscription_removed: bool) -> Result<()> {
         if self.restoring.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -409,11 +409,14 @@ impl Session {
             .map(|(thread, owner)| (*thread, owner.dispatcher.clone()))
             .collect();
         if owners.is_empty() {
+            if !subscription_removed {
+                return Ok(());
+            }
             SESSION_ACTIVE.store(false, Ordering::Release);
             self.status.stage(12);
             return unsafe { SetEvent(self.done.raw()) };
         }
-        let completion = Arc::new(RestoreCompletion::new(owners.len()));
+        let completion = Arc::new(RestoreCompletion::new(owners.len(), subscription_removed));
         for (thread, dispatcher) in owners {
             let session = self.clone();
             let remaining = completion.clone();
@@ -612,29 +615,42 @@ impl IObjectWithSite_Impl for Site_Impl {
                             SESSION_ACTIVE.store(false, Ordering::Release);
                             return;
                         }
+                        let mut subscription_removed = true;
                         let result = (|| -> Result<()> {
                             let tree = tree.resolve()?;
                             let callback = callback.resolve()?;
                             session.status.stage(6);
                             protocol::trace("Bridge.Advise");
-                            tree.AdviseVisualTreeChange(callback.as_raw()).ok()?;
-                            protocol::trace("Bridge.Advised");
-                            let status = WaitForMultipleObjects(
-                                &[process.raw(), stop.raw()],
-                                false,
-                                INFINITE,
-                            );
-                            if status == WAIT_FAILED {
-                                return Err(Error::from_win32());
-                            }
+                            subscription_removed = false;
+                            // Advise can register before failing during initial enumeration.
+                            let operation = (|| -> Result<()> {
+                                tree.AdviseVisualTreeChange(callback.as_raw()).ok()?;
+                                protocol::trace("Bridge.Advised");
+                                if WaitForMultipleObjects(
+                                    &[process.raw(), stop.raw()],
+                                    false,
+                                    INFINITE,
+                                ) == WAIT_FAILED
+                                {
+                                    return Err(Error::from_win32());
+                                }
+                                Ok(())
+                            })();
                             session.active.store(false, Ordering::Release);
-                            tree.UnadviseVisualTreeChange(callback.as_raw()).ok()?;
-                            session.restore()
+                            let removal = tree.UnadviseVisualTreeChange(callback.as_raw()).ok();
+                            subscription_removed = removal.is_ok();
+                            if let Err(error) = &removal {
+                                session.status.fail(error.code());
+                            }
+                            operation.and(removal)
                         })();
                         if let Err(error) = &result {
                             session.status.fail(error.code());
                             let _ = SetEvent(session.failed.raw());
-                            let _ = session.restore();
+                        }
+                        if let Err(error) = session.restore(subscription_removed) {
+                            session.status.fail(error.code());
+                            let _ = SetEvent(session.failed.raw());
                         }
                         // Callback and queued UI closures own event handles until their last reference ends.
                         CoUninitialize();
@@ -728,11 +744,14 @@ mod tests {
     use super::*;
     #[test]
     fn restore_waits_for_every_owner_and_never_hides_failure() {
-        let completion = RestoreCompletion::new(2);
+        let completion = RestoreCompletion::new(2, true);
         assert!(!completion.finish(true));
         assert!(completion.finish(true));
-        let completion = RestoreCompletion::new(2);
+        let completion = RestoreCompletion::new(2, true);
         assert!(!completion.finish(false));
+        assert!(!completion.finish(true));
+        let completion = RestoreCompletion::new(2, false);
+        assert!(!completion.finish(true));
         assert!(!completion.finish(true));
     }
 
