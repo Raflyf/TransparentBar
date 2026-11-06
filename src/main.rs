@@ -11,7 +11,7 @@ use windows::{
     Win32::{
         Foundation::*,
         System::{Com::*, LibraryLoader::*, Registry::*, Threading::*},
-        UI::{Shell::*, WindowsAndMessaging::*},
+        UI::{Accessibility::*, Shell::*, WindowsAndMessaging::*},
     },
 };
 
@@ -480,6 +480,20 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
     }
 }
 
+unsafe extern "system" fn foreground_changed(
+    _: HWINEVENTHOOK,
+    _: u32,
+    _: HWND,
+    _: i32,
+    _: i32,
+    _: u32,
+    _: u32,
+) {
+    if let Ok(hwnd) = FindWindowW(WINDOW_CLASS, None) {
+        SetTimer(hwnd, 1, 100, None);
+    }
+}
+
 fn run() -> Result<()> {
     unsafe {
         let mutex = CreateMutexW(None, false, w!(r"Local\TransparentBar.SingleInstance"))?;
@@ -519,6 +533,15 @@ fn run() -> Result<()> {
                 instance,
                 None,
             )?;
+            let foreground_hook = SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                None,
+                Some(foreground_changed),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
             let mut service: Option<TaskbarService> = None;
             let result = (|| {
                 let mut tray_ready = false;
@@ -634,6 +657,9 @@ fn run() -> Result<()> {
                     ..Default::default()
                 },
             );
+            if !foreground_hook.is_invalid() {
+                let _ = UnhookWinEvent(foreground_hook);
+            }
             let _ = DestroyWindow(hwnd);
             result.and(restore)
         })();

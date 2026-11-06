@@ -29,7 +29,7 @@ Deteksi struktur taskbar, bukan daftar build: legacy memakai composition attribu
 
 API shell bukan kontrak stabil untuk semua update Windows. Build masa depan, termasuk 26H2, tidak dapat dijamin sebelum diuji. Shell pihak ketiga, ARM64, serta XAML multi-monitor dengan dispatcher terpisah perlu pengujian/adapter tersendiri. Unsupported taskbar memberi error, bukan klaim sukses palsu. Jangan menjalankan bersamaan dengan pengubah taskbar lain.
 
-Bridge dimuat dalam Explorer sampai Explorer berakhir. Tidak mengganti file Windows. Pemulihan XAML menjaga nilai opacity asli; binding/style lain di luar cakupan. Jika Windows menolak akses atau taskbar berubah, aplikasi memberi error; jangan matikan antivirus atau menjalankan sebagai administrator sebagai solusi default.
+Bridge dimuat dalam Explorer sampai Explorer berakhir. Tidak mengganti file Windows. Pemulihan XAML menjaga nilai opacity asli; binding/style lain di luar cakupan. Jika Windows menolak pemulihan, backup nilai ditahan dan sesi terkunci sampai Explorer restart agar perubahan baru tidak menimpa backup. Jika Windows menolak akses atau taskbar berubah, aplikasi memberi error; jangan matikan antivirus atau menjalankan sebagai administrator sebagai solusi default.
 
 Idle memakai blocking Windows message wait. Timer dipakai sementara untuk kesiapan awal dan event refresh, bukan loop polling permanen. RAM/CPU belum dibenchmark; tidak ada angka perkiraan sebagai klaim. Pengguna menguji instalasi, transparansi, login, dan monitor nyata.
 
