@@ -140,7 +140,7 @@ impl UiDispatcher {
             }
             Self::Queue(dispatcher) => {
                 if !dispatcher.TryEnqueue(&DispatcherQueueHandler::new(action))? {
-                    return Err(Error::new(E_FAIL, "Dispatcher taskbar sedang berhenti."));
+                    return Err(Error::new(E_FAIL, "Taskbar dispatcher has stopped."));
                 }
             }
         }
@@ -225,7 +225,7 @@ impl TreeState {
         if !self.saved.is_empty() {
             return Err(Error::new(
                 E_ILLEGAL_METHOD_CALL,
-                "Backup taskbar sesi lama belum dipulihkan.",
+                "Previous session taskbar backup has not been restored yet.",
             ));
         }
         *self = Self {
@@ -271,7 +271,7 @@ impl Session {
             _ => {
                 return Err(Error::new(
                     RPC_E_WRONG_THREAD,
-                    "Callback XAML bukan pada UI thread pemilik.",
+                    "XAML callback is not on the owning UI thread.",
                 ))
             }
         };
@@ -413,7 +413,7 @@ impl Session {
                             if actual != 0.0 {
                                 return Err(Error::new(
                                     E_FAIL,
-                                    "Readback opacity taskbar bukan 0.",
+                                    "Taskbar opacity readback is not 0.",
                                 ));
                             }
                         }

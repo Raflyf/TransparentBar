@@ -1,9 +1,9 @@
 [package]
 name = "transparentbar"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 license = "MIT"
-description = "Taskbar transparan Windows, dengan startup opsional"
+description = "Native Windows taskbar transparency utility with optional startup"
 
 [lib]
 name = "transparentbar_bridge"

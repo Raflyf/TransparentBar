@@ -70,9 +70,14 @@ pub fn check_in_background(hwnd: HWND, manual: bool, notify_message: u32) {
                     );
                 }
             }
-            Ok(_) if manual => unsafe {
-                let _ = PostMessageW(target, notify_message, WPARAM(1), LPARAM(0));
-            },
+            Ok(tag) if manual => {
+                if is_newer(&tag, CURRENT_VERSION) {
+                    set_available_tag(tag);
+                }
+                unsafe {
+                    let _ = PostMessageW(target, notify_message, WPARAM(1), LPARAM(0));
+                }
+            }
             Err(_) if manual => unsafe {
                 let _ = PostMessageW(target, notify_message, WPARAM(1), LPARAM(-1));
             },
@@ -161,10 +166,10 @@ fn fetch_tag_from_redirect() -> Result<String> {
             &mut bytes,
             &mut index,
         )?;
-        let len = (bytes as usize / 2).saturating_sub(1);
-        let location = String::from_utf16_lossy(&buffer[..len.min(buffer.len())]);
+        let nul = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+        let location = String::from_utf16_lossy(&buffer[..nul]);
         extract_tag_from_location(&location)
-            .ok_or_else(|| Error::new(E_FAIL, "Tag rilis tidak ditemukan."))
+            .ok_or_else(|| Error::new(E_FAIL, "Release tag was not found in redirect location."))
     }
 }
 
@@ -220,13 +225,18 @@ fn fetch_tag_from_api() -> Result<String> {
             body.extend_from_slice(&chunk[..read as usize]);
         }
         let text = String::from_utf8_lossy(&body);
-        extract_tag_from_json(&text).ok_or_else(|| Error::new(E_FAIL, "Tag API tidak ditemukan."))
+        extract_tag_from_json(&text)
+            .ok_or_else(|| Error::new(E_FAIL, "Release tag was not found in API response."))
     }
 }
 
 pub(crate) fn extract_tag_from_location(location: &str) -> Option<String> {
     let (_, tail) = location.rsplit_once("/releases/tag/")?;
-    let tag = tail.split(['?', '#', '/']).next()?.trim();
+    let tag = tail
+        .trim_end_matches('\0')
+        .split(['?', '#', '/'])
+        .next()?
+        .trim();
     if parse_semver(tag).is_some() {
         Some(tag.to_string())
     } else {
@@ -248,7 +258,9 @@ pub(crate) fn extract_tag_from_json(json: &str) -> Option<String> {
 }
 
 pub(crate) fn parse_semver(version: &str) -> Option<(u32, u32, u32)> {
-    let clean = version.trim().trim_start_matches(['v', 'V']);
+    let clean = version
+        .trim_matches(|c: char| c.is_whitespace() || c == '\0')
+        .trim_start_matches(['v', 'V']);
     let core = clean.split(['-', '+']).next()?;
     let mut parts = core.split('.');
     let major = parts.next()?.parse().ok()?;

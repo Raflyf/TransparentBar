@@ -74,13 +74,13 @@ Browse [all releases](https://github.com/Raflyf/transparentbar/releases) for ear
 
 | Tray option | Action |
 | --- | --- |
-| **Penyambung taskbar** | Toggle the maximized-window gradient connector strip |
-| **Jalankan saat login** | Toggle startup at Windows sign-in |
-| **Cek pembaruan** / **Pembaruan tersedia** | Check GitHub Releases for a newer version, or open the latest release page when an update is found |
-| **Tentang / lisensi** | View version and license information |
-| **Keluar** | Restore the saved appearance and exit |
+| **Taskbar connector** | Toggle the maximized-window gradient connector strip |
+| **Run at sign-in** | Toggle startup at Windows sign-in |
+| **Check for updates** / **Update available** | Check GitHub Releases for a newer version, or open the latest release page when an update is found |
+| **About / license** | View version and license information |
+| **Exit** | Restore the saved appearance and exit |
 
-The tray menu currently uses Indonesian labels and supports keyboard navigation. Opening the application again opens the existing instance's menu.
+The tray menu uses English labels, supports keyboard navigation, and adapts to the Windows system dark or light theme. Opening the application again opens the existing instance's menu.
 
 For portable use, keep the executable and its versioned bridge DLL together. If you move the folder after enabling startup, disable and re-enable startup from the new location.
 
@@ -102,7 +102,7 @@ The build pipeline supports Authenticode signing when the maintainer provides a 
 <details>
 <summary><strong>Taskbar restoration and updates</strong></summary>
 
-Choose **Keluar** to restore the saved taskbar appearance before closing. The XAML bridge also watches for the host process to exit. If Windows rejects restoration, the application reports an error rather than discarding the saved state.
+Choose **Exit** to restore the saved taskbar appearance before closing. The XAML bridge also watches for the host process to exit. If Windows rejects restoration, the application reports an error rather than discarding the saved state.
 
 Windows keeps the XAML bridge loaded in Explorer for the remainder of that Explorer session. A versioned DLL allows application updates without overwriting the loaded image. TransparentBar does not replace Windows system files.
 

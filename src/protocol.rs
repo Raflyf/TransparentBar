@@ -5,7 +5,7 @@ use windows::{
 };
 
 #[allow(dead_code)]
-pub const BRIDGE_FILE: &str = "transparentbar_bridge-0.1.6.dll";
+pub const BRIDGE_FILE: &str = "transparentbar_bridge-0.1.7.dll";
 pub const BRIDGE_CLSID: GUID = GUID::from_u128(0x54cd5c4a_0d6d_4ef0_9c4b_94e2828d2351);
 #[allow(dead_code)]
 pub type InitializeXaml =
@@ -18,7 +18,7 @@ pub fn event_name(host: u32, shell: u32, generation: u32, kind: &str) -> Vec<u16
         .collect()
 }
 fn status_name(shell: u32) -> Vec<u16> {
-    format!(r"Local\TransparentBar.0.1.6.Status.{shell}")
+    format!(r"Local\TransparentBar.0.1.7.Status.{shell}")
         .encode_utf16()
         .chain([0])
         .collect()
@@ -60,7 +60,7 @@ impl StatusChannel {
             )?;
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 let _ = CloseHandle(mapping);
-                return Err(Error::new(E_FAIL, "Sesi bridge sebelumnya belum selesai. Tutup instance lama sebelum membuka ulang."));
+                return Err(Error::new(E_FAIL, "The previous bridge session has not finished yet. Close the existing instance before reopening."));
             }
             let channel = Self::map(mapping)?;
             channel
@@ -138,21 +138,21 @@ impl StatusChannel {
     pub fn describe(&self) -> String {
         let data = self.data();
         let stage = match data.stage.load(Ordering::Acquire) {
-            0 => "DLL/COM belum merespons",
-            1 => "Factory COM",
+            0 => "DLL/COM not responding yet",
+            1 => "COM factory",
             2 => "SetSite",
-            3 => "Antarmuka XAML",
-            4 => "Dispatcher UI",
-            5 => "Kanal sesi",
-            6 => "Registrasi callback",
-            7 => "Callback diterima",
-            8 => "Frame taskbar",
+            3 => "XAML interface",
+            4 => "UI dispatcher",
+            5 => "Session channel",
+            6 => "Callback registration",
+            7 => "Callback received",
+            8 => "Taskbar frame",
             9 => "BackgroundFill",
-            10 if data.inspect != 0 => "Elemen ditemukan (diagnostic read-only)",
-            10 => "Transparansi terkonfirmasi",
-            11 => "Pemulihan",
-            12 => "Pemulihan selesai",
-            _ => "Tahap tidak dikenal",
+            10 if data.inspect != 0 => "Elements found (read-only diagnostic)",
+            10 => "Transparency confirmed",
+            11 => "Restoration",
+            12 => "Restoration complete",
+            _ => "Unknown stage",
         };
         format!(
             "{stage}; callbacks={}, frames={}, fill={}, border={}",

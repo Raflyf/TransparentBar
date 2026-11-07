@@ -7,7 +7,7 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 use windows::{
-    core::{s, w, Error, Result, PCWSTR},
+    core::{s, w, Error, Result, PCSTR, PCWSTR},
     Win32::{
         Foundation::*,
         System::{Com::*, LibraryLoader::*, Registry::*, Threading::*},
@@ -108,7 +108,7 @@ impl XamlSession {
                 if !bridge.is_file() {
                     return Err(Error::new(
                         E_FAIL,
-                        format!("{BRIDGE_FILE} harus di folder aplikasi."),
+                        format!("{BRIDGE_FILE} must be in the application folder."),
                     ));
                 }
                 let bridge = wide(bridge.as_os_str());
@@ -150,7 +150,7 @@ impl XamlSession {
                 };
                 return Err(Error::new(
                     code,
-                    format!("Bridge gagal: {}", self.status.describe()),
+                    format!("Bridge failed: {}", self.status.describe()),
                 ));
             }
             Ok(WaitForSingleObject(self.ready, 0) == WAIT_OBJECT_0)
@@ -162,7 +162,7 @@ impl XamlSession {
             if WaitForSingleObject(self.done, 3000) != WAIT_OBJECT_0 {
                 return Err(Error::new(
                     E_FAIL,
-                    "Pemulihan taskbar belum terkonfirmasi. Explorer mungkin sedang berhenti.",
+                    "Taskbar restoration was not confirmed. Explorer may have stopped responding.",
                 ));
             }
         }
@@ -250,7 +250,7 @@ impl TaskbarService {
                     if !set(hwnd, &mut data).as_bool() {
                         return Err(Error::new(
                             E_FAIL,
-                            "Windows tidak menerima transparansi taskbar legacy.",
+                            "Windows rejected legacy taskbar transparency.",
                         ));
                     }
                     previous = hwnd;
@@ -281,7 +281,7 @@ impl TaskbarService {
                 if !set(*hwnd, &mut data).as_bool() {
                     return Err(Error::new(
                         E_FAIL,
-                        "Windows menolak pemulihan taskbar legacy.",
+                        "Windows rejected legacy taskbar restoration.",
                     ));
                 }
             }
@@ -332,7 +332,7 @@ fn set_startup(enabled: bool) -> Result<()> {
         if command.len() > 261 {
             return Err(Error::new(
                 E_INVALIDARG,
-                "Path terlalu panjang untuk startup Windows. Pindahkan folder aplikasi.",
+                "The application path is too long for Windows startup. Move the folder to a shorter path.",
             ));
         }
         let mut key = HKEY::default();
@@ -415,12 +415,40 @@ fn set_settings_flag(value: PCWSTR, enabled: bool) -> Result<()> {
     }
 }
 
+fn apply_menu_theme() {
+    unsafe {
+        let mut data = 1u32;
+        let mut bytes = std::mem::size_of::<u32>() as u32;
+        let status = RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut data as *mut u32).cast()),
+            Some(&mut bytes),
+        );
+        let dark = status.is_ok() && data == 0;
+        if let Ok(uxtheme) = LoadLibraryExW(w!("uxtheme.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) {
+            if let Some(set_mode) = GetProcAddress(uxtheme, PCSTR(135usize as *const u8)) {
+                let set_mode: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(set_mode);
+                let _ = set_mode(if dark { 2 } else { 3 });
+            }
+            if let Some(flush) = GetProcAddress(uxtheme, PCSTR(136usize as *const u8)) {
+                let flush: unsafe extern "system" fn() = std::mem::transmute(flush);
+                flush();
+            }
+            let _ = FreeLibrary(uxtheme);
+        }
+    }
+}
+
 fn show_error(error: &Error) {
     eprintln!("{error}");
     let text = wide(std::ffi::OsStr::new(&format!(
         "{error}
 
-Kirim pesan error ini untuk diagnosis. Detail startup: %LOCALAPPDATA%\\TransparentBar\\startup.log"
+Share this error message when reporting an issue. Startup log: %LOCALAPPDATA%\\TransparentBar\\startup.log"
     )));
     unsafe {
         MessageBoxW(None, PCWSTR(text.as_ptr()), NAME, MB_OK | MB_ICONERROR);
@@ -438,10 +466,10 @@ fn add_tray(hwnd: HWND, application_icon: HICON) -> Result<()> {
             hIcon: application_icon,
             ..Default::default()
         };
-        let tip = wide(std::ffi::OsStr::new("TransparentBar - taskbar transparan"));
+        let tip = wide(std::ffi::OsStr::new("TransparentBar - transparent taskbar"));
         icon.szTip[..tip.len()].copy_from_slice(&tip);
         if !Shell_NotifyIconW(NIM_ADD, &icon).as_bool() {
-            return Err(Error::new(E_FAIL, "Explorer belum menerima ikon tray. Tunggu sampai taskbar siap, lalu buka ulang aplikasi."));
+            return Err(Error::new(E_FAIL, "Explorer has not accepted the tray icon yet. Wait until the taskbar is ready, then reopen the application."));
         }
         icon.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         // Unsupported v4 keeps legacy notifications; GetLastError is not part of this API contract.
@@ -451,6 +479,7 @@ fn add_tray(hwnd: HWND, application_icon: HICON) -> Result<()> {
 }
 
 fn menu(hwnd: HWND, point: POINT) -> Result<usize> {
+    apply_menu_theme();
     let enabled = startup_enabled()?;
     let connector = settings_flag(CONNECTOR_VALUE, true)?;
     unsafe {
@@ -460,25 +489,23 @@ fn menu(hwnd: HWND, point: POINT) -> Result<usize> {
                 popup,
                 MF_STRING | if connector { MF_CHECKED } else { MF_UNCHECKED },
                 CONNECTOR,
-                w!("Penyambung &taskbar"),
+                w!("&Taskbar connector"),
             )?;
             AppendMenuW(
                 popup,
                 MF_STRING | if enabled { MF_CHECKED } else { MF_UNCHECKED },
                 STARTUP,
-                w!("Jalankan saat &login"),
+                w!("Run at &sign-in"),
             )?;
             AppendMenuW(popup, MF_SEPARATOR, 0, None)?;
             if let Some(tag) = updater::available_tag() {
-                let label = wide(std::ffi::OsStr::new(&format!(
-                    "&Pembaruan tersedia ({tag})"
-                )));
+                let label = wide(std::ffi::OsStr::new(&format!("&Update available ({tag})")));
                 AppendMenuW(popup, MF_STRING, UPDATE, PCWSTR(label.as_ptr()))?;
             } else {
-                AppendMenuW(popup, MF_STRING, UPDATE, w!("&Cek pembaruan"))?;
+                AppendMenuW(popup, MF_STRING, UPDATE, w!("&Check for updates"))?;
             }
-            AppendMenuW(popup, MF_STRING, ABOUT, w!("&Tentang / lisensi"))?;
-            AppendMenuW(popup, MF_STRING, EXIT, w!("&Keluar"))?;
+            AppendMenuW(popup, MF_STRING, ABOUT, w!("&About / license"))?;
+            AppendMenuW(popup, MF_STRING, EXIT, w!("E&xit"))?;
             let _ = SetForegroundWindow(hwnd);
             let selected = TrackPopupMenu(
                 popup,
@@ -534,13 +561,13 @@ fn command(hwnd: HWND, id: usize) -> Result<bool> {
         ABOUT => unsafe {
             MessageBoxW(
                 None,
-                w!("TransparentBar 0.1.6
-Native Rust, Windows 10 dan 11 x64.
+                w!("TransparentBar 0.1.7
+Native Rust, Windows 10 and 11 x64.
 Copyright 2026 Rafly Firmansyah.
-MIT License; boleh dibagikan sesuai lisensi. Tanpa garansi.
-Source: github.com/Raflyf/transparentbar
+MIT License; may be redistributed under license terms. No warranty.
+Source: github.com/Raflyf/TransparentBar
 
-Pengaturan startup berlaku untuk akun Windows ini saja."),
+Startup settings apply to the current Windows user account only."),
                 NAME,
                 MB_OK,
             );
@@ -753,7 +780,7 @@ fn run() -> Result<()> {
                                             .as_ref()
                                             .map(|session| session.status.describe())
                                             .unwrap_or_default();
-                                        return Err(Error::new(E_FAIL, format!("Taskbar belum siap: {detail}. Log: %LOCALAPPDATA%\\TransparentBar\\startup.log")));
+                                        return Err(Error::new(E_FAIL, format!("Taskbar is not ready yet: {detail}. Log: %LOCALAPPDATA%\\TransparentBar\\startup.log")));
                                     }
                                     readiness -= 1;
                                     schedule(hwnd, 500)?;
@@ -794,28 +821,47 @@ fn run() -> Result<()> {
                             match msg.lParam.0 {
                                 1 => {
                                     if let Some(tag) = updater::available_tag() {
-                                        updater::show_balloon(
-                                            hwnd,
-                                            &format!("Pembaruan tersedia: {tag}"),
-                                            "Klik notifikasi ini atau buka menu tray untuk mengunduh rilis terbaru.",
-                                        );
+                                        if manual {
+                                            let text = wide(std::ffi::OsStr::new(&format!(
+                                                "A new release ({tag}) is available on GitHub.\n\nCurrent version: v{}\n\nOpen the release download page now?",
+                                                updater::CURRENT_VERSION
+                                            )));
+                                            if MessageBoxW(
+                                                None,
+                                                PCWSTR(text.as_ptr()),
+                                                NAME,
+                                                MB_YESNO | MB_ICONINFORMATION,
+                                            ) == IDYES
+                                            {
+                                                updater::open_release_page(hwnd);
+                                            }
+                                        } else {
+                                            updater::show_balloon(
+                                                hwnd,
+                                                &format!("Update available: {tag}"),
+                                                "Click this notification or open the tray menu to download the latest release.",
+                                            );
+                                        }
                                     }
                                 }
                                 0 if manual => {
-                                    updater::show_balloon(
-                                        hwnd,
-                                        "TransparentBar sudah versi terbaru",
-                                        &format!(
-                                            "Versi v{} adalah rilis terbaru saat ini.",
-                                            updater::CURRENT_VERSION
-                                        ),
+                                    let text = wide(std::ffi::OsStr::new(&format!(
+                                        "You are using the latest version of TransparentBar (v{}).",
+                                        updater::CURRENT_VERSION
+                                    )));
+                                    MessageBoxW(
+                                        None,
+                                        PCWSTR(text.as_ptr()),
+                                        NAME,
+                                        MB_OK | MB_ICONINFORMATION,
                                     );
                                 }
                                 _ if manual => {
-                                    updater::show_balloon(
-                                        hwnd,
-                                        "Gagal memeriksa pembaruan",
-                                        "Periksa koneksi internet Anda lalu coba lagi dari menu tray.",
+                                    MessageBoxW(
+                                        None,
+                                        w!("Could not check for updates. Check your internet connection and try again."),
+                                        NAME,
+                                        MB_OK | MB_ICONWARNING,
                                     );
                                 }
                                 _ => (),
@@ -968,11 +1014,11 @@ mod tests {
 
     #[test]
     fn startup_quotes_path_and_preserves_unicode() {
-        let command = startup_command(Path::new(r"C:\Aplikasi Saya\café\transparentbar.exe"));
+        let command = startup_command(Path::new(r"C:\My Apps\café\transparentbar.exe"));
         assert_eq!(command.last(), Some(&0));
         assert_eq!(
             String::from_utf16(&command[..command.len() - 1]).unwrap(),
-            r#""C:\Aplikasi Saya\café\transparentbar.exe""#
+            r#""C:\My Apps\café\transparentbar.exe""#
         );
     }
 
@@ -1046,6 +1092,12 @@ mod tests {
         assert_eq!(
             updater::extract_tag_from_json(r#"{"tag_name": "v0.2.0", "draft": false}"#),
             Some("v0.2.0".to_string())
+        );
+        assert_eq!(
+            updater::extract_tag_from_location(
+                "https://github.com/Raflyf/TransparentBar/releases/tag/v0.1.7\0\0\0"
+            ),
+            Some("v0.1.7".to_string())
         );
         assert!(updater::is_newer("v0.1.6", "0.1.5"));
         assert!(updater::is_newer("v0.2.0", "0.1.5"));
