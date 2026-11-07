@@ -33,6 +33,9 @@ const CONNECTOR: usize = 4;
 const UPDATE: usize = 5;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const REFRESH_TIMER_ID: usize = 1;
+const CONNECTOR_TIMER_ID: usize = 2;
+const CONNECTOR_REFRESH_MS: u32 = 120;
+const CONNECTOR_IDLE_MS: u32 = 1000;
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 mod connector;
@@ -532,11 +535,43 @@ fn is_tray_menu(notification: u32) -> bool {
     )
 }
 
-fn is_refresh_timer(hwnd: HWND, message: &MSG) -> bool {
+fn is_window_timer(hwnd: HWND, message: &MSG, id: usize) -> bool {
     message.message == WM_TIMER
         && message.hwnd == hwnd
-        && message.wParam.0 == REFRESH_TIMER_ID
+        && message.wParam.0 == id
         && message.lParam.0 == 0
+}
+
+fn connector_interval(enabled: bool, active: bool) -> Option<u32> {
+    enabled.then_some(if active {
+        CONNECTOR_REFRESH_MS
+    } else {
+        CONNECTOR_IDLE_MS
+    })
+}
+
+fn update_connector(
+    hwnd: HWND,
+    strip: &mut Option<connector::Connector>,
+    enabled: bool,
+    interval: &mut Option<u32>,
+) {
+    let active = strip
+        .as_mut()
+        .is_some_and(|strip| strip.update(enabled).unwrap_or(false));
+    let next = connector_interval(enabled && strip.is_some(), active);
+    if next != *interval {
+        unsafe {
+            let _ = KillTimer(hwnd, CONNECTOR_TIMER_ID);
+            *interval = next.filter(|&ms| SetTimer(hwnd, CONNECTOR_TIMER_ID, ms, None) != 0);
+            if next.is_some() && interval.is_none() {
+                if let Some(strip) = strip {
+                    strip.hide();
+                }
+                protocol::trace("Connector timer could not be created; strip hidden.");
+            }
+        }
+    }
 }
 
 fn schedule(hwnd: HWND, delay_ms: u32) -> Result<()> {
@@ -561,7 +596,7 @@ fn command(hwnd: HWND, id: usize) -> Result<bool> {
         ABOUT => unsafe {
             MessageBoxW(
                 None,
-                w!("TransparentBar 0.1.7
+                w!("TransparentBar 0.1.8
 Native Rust, Windows 10 and 11 x64.
 Copyright 2026 Rafly Firmansyah.
 MIT License; may be redistributed under license terms. No warranty.
@@ -694,7 +729,9 @@ fn run() -> Result<()> {
             );
             let mut service: Option<TaskbarService> = None;
             let mut connector = connector::Connector::create().ok();
+            let mut connector_timer = None;
             let result = (|| {
+                let mut connector_enabled = settings_flag(CONNECTOR_VALUE, true)?;
                 let mut tray_ready = false;
                 let mut update_checked = false;
                 let mut retries = 3u8;
@@ -720,16 +757,29 @@ fn run() -> Result<()> {
                             schedule(hwnd, 1000)?;
                         }
                         REFRESH_MESSAGE => {
+                            connector_enabled =
+                                settings_flag(CONNECTOR_VALUE, true).unwrap_or(false);
                             schedule(hwnd, 500)?;
                         }
-                        WM_TIMER if is_refresh_timer(hwnd, &msg) => {
+                        WM_TIMER if is_window_timer(hwnd, &msg, CONNECTOR_TIMER_ID) => {
+                            if connector_timer.is_some() {
+                                update_connector(
+                                    hwnd,
+                                    &mut connector,
+                                    connector_enabled,
+                                    &mut connector_timer,
+                                );
+                            }
+                        }
+                        WM_TIMER if is_window_timer(hwnd, &msg, REFRESH_TIMER_ID) => {
                             // KillTimer leaves queued ticks behind; an already-removed timer is harmless.
                             let _ = KillTimer(hwnd, REFRESH_TIMER_ID);
-                            if let Some(strip) = connector.as_ref() {
-                                // Cosmetic: a failure keeps the taskbar itself working.
-                                let _ = strip
-                                    .update(settings_flag(CONNECTOR_VALUE, true).unwrap_or(true));
-                            }
+                            update_connector(
+                                hwnd,
+                                &mut connector,
+                                connector_enabled,
+                                &mut connector_timer,
+                            );
                             if RESTART.swap(false, Ordering::AcqRel) {
                                 service = None;
                                 generation += 1;
@@ -802,12 +852,15 @@ fn run() -> Result<()> {
                                         Ok(true) => PostQuitMessage(0),
                                         Ok(false) => {
                                             if selected == CONNECTOR {
-                                                if let Some(strip) = connector.as_ref() {
-                                                    let _ = strip.update(
-                                                        settings_flag(CONNECTOR_VALUE, true)
-                                                            .unwrap_or(true),
-                                                    );
-                                                }
+                                                connector_enabled =
+                                                    settings_flag(CONNECTOR_VALUE, true)
+                                                        .unwrap_or(false);
+                                                update_connector(
+                                                    hwnd,
+                                                    &mut connector,
+                                                    connector_enabled,
+                                                    &mut connector_timer,
+                                                );
                                             }
                                         }
                                         Err(error) => show_error(&error),
@@ -873,12 +926,14 @@ fn run() -> Result<()> {
                                 Ok(true) => break,
                                 Ok(false) => {
                                     if selected == CONNECTOR {
-                                        if let Some(strip) = connector.as_ref() {
-                                            let _ = strip.update(
-                                                settings_flag(CONNECTOR_VALUE, true)
-                                                    .unwrap_or(true),
-                                            );
-                                        }
+                                        connector_enabled =
+                                            settings_flag(CONNECTOR_VALUE, true).unwrap_or(false);
+                                        update_connector(
+                                            hwnd,
+                                            &mut connector,
+                                            connector_enabled,
+                                            &mut connector_timer,
+                                        );
                                     }
                                 }
                                 Err(error) => show_error(&error),
@@ -892,6 +947,8 @@ fn run() -> Result<()> {
                 }
                 Ok(())
             })();
+            let _ = KillTimer(hwnd, CONNECTOR_TIMER_ID);
+            let _ = KillTimer(hwnd, REFRESH_TIMER_ID);
             drop(connector.take());
             let restore = if let Some(service) = service.take() {
                 service.restore()
@@ -982,7 +1039,7 @@ mod tests {
             wParam: WPARAM(REFRESH_TIMER_ID),
             ..Default::default()
         };
-        assert!(is_refresh_timer(window, &own));
+        assert!(is_window_timer(window, &own, REFRESH_TIMER_ID));
         for foreign in [
             MSG {
                 hwnd: HWND::default(),
@@ -1006,10 +1063,64 @@ mod tests {
             },
         ] {
             assert!(
-                !is_refresh_timer(window, &foreign),
+                !is_window_timer(window, &foreign, REFRESH_TIMER_ID),
                 "foreign timer was consumed"
             );
         }
+    }
+
+    #[test]
+    fn connector_timer_is_owned_and_stops_when_disabled() {
+        let window = HWND(0x100usize as *mut c_void);
+        let tick = MSG {
+            hwnd: window,
+            message: WM_TIMER,
+            wParam: WPARAM(CONNECTOR_TIMER_ID),
+            ..Default::default()
+        };
+        assert!(is_window_timer(window, &tick, CONNECTOR_TIMER_ID));
+        assert!(!is_window_timer(window, &tick, REFRESH_TIMER_ID));
+        for foreign in [
+            MSG {
+                hwnd: HWND::default(),
+                ..tick
+            },
+            MSG {
+                wParam: WPARAM(CONNECTOR_TIMER_ID + 1),
+                ..tick
+            },
+            MSG {
+                lParam: LPARAM(1),
+                ..tick
+            },
+        ] {
+            assert!(!is_window_timer(window, &foreign, CONNECTOR_TIMER_ID));
+        }
+        assert_eq!(connector_interval(true, true), Some(120));
+        assert_eq!(connector_interval(true, false), Some(1000));
+        assert_eq!(connector_interval(false, true), None);
+        assert_eq!(connector_interval(false, false), None);
+    }
+
+    #[test]
+    fn connector_scanline_preserves_separate_colors_and_changes_with_content() {
+        let row = [[30, 20, 10, 255], [200, 180, 160, 255], [60, 80, 100, 255]].concat();
+        let capture = [row.clone(), row.clone()].concat();
+        let colors = connector::smooth_scanline(&capture, 3, 2, 0);
+        assert_eq!(colors, [(10, 20, 30), (160, 180, 200), (100, 80, 60)]);
+        let mut pixels = vec![0; 3 * 4 * 4];
+        connector::fill_gradient_columns(&mut pixels, 3, 4, &colors);
+        assert_ne!(&pixels[0..4], &pixels[4..8]);
+        assert_ne!(&pixels[4..8], &pixels[8..12]);
+        assert!(pixels[3 * 3 * 4..].iter().all(|&byte| byte == 0));
+        let mut scrolled = capture;
+        scrolled[6] = 0;
+        assert_ne!(connector::smooth_scanline(&scrolled, 3, 2, 0), colors);
+        assert_eq!(
+            connector::smooth_scanline(&row, 3, 1, 1),
+            [(85, 100, 115), (90, 93, 96), (130, 130, 130)]
+        );
+        assert!(connector::smooth_scanline(&[], 0, 0, 8).is_empty());
     }
 
     #[test]
@@ -1047,7 +1158,7 @@ mod tests {
     #[test]
     fn connector_gradient_fades_and_premultiplies_alpha() {
         let mut pixels = vec![0u8; 4 * 5 * 4];
-        connector::fill_gradient(&mut pixels, 4, 5, 200, 100, 50);
+        connector::fill_gradient_columns(&mut pixels, 4, 5, &[(200, 100, 50); 4]);
         let top_alpha = pixels[3];
         assert!(top_alpha > 150);
         assert_eq!(pixels[0], ((50u32 * u32::from(top_alpha)) / 255) as u8);
@@ -1055,8 +1166,6 @@ mod tests {
         assert_eq!(pixels[2], ((200u32 * u32::from(top_alpha)) / 255) as u8);
         let last = (4 * 4) * 4;
         assert_eq!(&pixels[last..last + 4], &[0, 0, 0, 0]);
-        assert_eq!(connector::decode_colorref(u32::MAX), (17, 16, 14));
-        assert_eq!(connector::decode_colorref(0x00332211), (0x11, 0x22, 0x33));
         assert!(connector::is_shell_class("Shell_TrayWnd"));
         assert!(!connector::is_shell_class("Chrome_WidgetWin_1"));
         let bar = RECT {

@@ -35,9 +35,9 @@ Your wallpaper stays visible behind pinned apps and system controls. This framed
 ## Features
 
 - **Transparent taskbar.** A clear background without blur or color effects.
-- **Maximized-window connector.** An optional soft gradient strip at the top of the taskbar bridges maximized windows so the transition into the transparent bar is less abrupt. Toggle it on or off from the tray menu.
+- **Maximized-window connector.** An optional soft gradient strip follows the visible bottom edge of a maximized window, preserving different colors across its width and updating as content scrolls. Toggle it on or off from the tray menu. Fullscreen windows hide the strip.
 - **Native Rust.** No webview, browser engine, or bundled UI framework.
-- **Event-driven.** Responds to Windows events instead of continuously polling the desktop.
+- **Conditional refresh.** Taskbar transparency responds to Windows events. The connector samples a four-pixel-high edge every 120 ms only while a supported maximized window is active, and uploads its gradient only when colors or geometry change. While inactive, an enabled connector checks window eligibility once per second without capturing pixels; disabling it stops that timer.
 - **Optional startup.** Enable or disable launch at sign-in from the tray menu. Off by default.
 - **Release update check.** Checks GitHub Releases for a newer version and notifies you from the system tray, with a manual check option in the tray menu.
 - **Installer or portable.** Install for your account, or extract a ZIP and run it.
@@ -83,6 +83,8 @@ Browse [all releases](https://github.com/Raflyf/transparentbar/releases) for ear
 The tray menu uses English labels, supports keyboard navigation, and adapts to the Windows system dark or light theme. Opening the application again opens the existing instance's menu.
 
 For portable use, keep the executable and its versioned bridge DLL together. If you move the folder after enabling startup, disable and re-enable startup from the new location.
+
+The connector currently supports the primary bottom-docked taskbar with auto-hide off. It samples a thin visible screen band above its own overlay, averages four rows, and smooths nearby columns to reduce text noise. It is a softened approximation of that edge, not a capture of the entire application. Pixels stay in memory and are never saved or uploaded. Unsupported taskbar placements and fullscreen windows hide the connector.
 
 ## Compatibility
 
