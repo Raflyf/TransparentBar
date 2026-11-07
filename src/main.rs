@@ -34,7 +34,7 @@ const UPDATE: usize = 5;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const REFRESH_TIMER_ID: usize = 1;
 const CONNECTOR_TIMER_ID: usize = 2;
-const CONNECTOR_REFRESH_MS: u32 = 120;
+const CONNECTOR_REFRESH_MS: u32 = 60;
 const CONNECTOR_IDLE_MS: u32 = 1000;
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -596,7 +596,7 @@ fn command(hwnd: HWND, id: usize) -> Result<bool> {
         ABOUT => unsafe {
             MessageBoxW(
                 None,
-                w!("TransparentBar 0.1.9
+                w!("TransparentBar 0.1.10
 Native Rust, Windows 10 and 11 x64.
 Copyright 2026 Rafly Firmansyah.
 MIT License; may be redistributed under license terms. No warranty.
@@ -1133,7 +1133,7 @@ mod tests {
         ] {
             assert!(!is_window_timer(window, &foreign, CONNECTOR_TIMER_ID));
         }
-        assert_eq!(connector_interval(true, true), Some(120));
+        assert_eq!(connector_interval(true, true), Some(60));
         assert_eq!(connector_interval(true, false), Some(1000));
         assert_eq!(connector_interval(false, true), None);
         assert_eq!(connector_interval(false, false), None);

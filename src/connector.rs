@@ -18,8 +18,10 @@ const CLASS: PCWSTR = w!("TransparentBar.Connector");
 // Base sizes are device pixels at 96 DPI; Metrics scales them per monitor.
 const BASE_SEAM_OVERLAP: i32 = 2;
 const BASE_SAMPLE_ROWS: i32 = 4;
+/// Fraction of the remaining colour gap closed per frame, which produces the fade.
+const BLEND_STEP: f32 = 0.3;
 const BASE_BLUR_RADIUS: i32 = 8;
-const BASE_STRIP_HEIGHT: i32 = 42;
+const BASE_STRIP_HEIGHT: i32 = 34;
 const BASE_FRAME_OVERHANG: i32 = 14;
 const BASE_EDGE_SLACK: i32 = 4;
 const TOP_ALPHA: f32 = 0.90;
@@ -170,7 +172,8 @@ pub struct Connector {
     sample: Option<Dib>,
     image: Option<Dib>,
     last_rect: Option<RECT>,
-    last_columns: Vec<(u8, u8, u8)>,
+    shown: Vec<(u8, u8, u8)>,
+    uploaded: Vec<(u8, u8, u8)>,
 }
 
 impl Connector {
@@ -208,7 +211,8 @@ impl Connector {
                 sample: None,
                 image: None,
                 last_rect: None,
-                last_columns: Vec::new(),
+                shown: Vec::new(),
+                uploaded: Vec::new(),
             })
         }
     }
@@ -220,7 +224,8 @@ impl Connector {
             }
         }
         self.last_rect = None;
-        self.last_columns.clear();
+        self.shown.clear();
+        self.uploaded.clear();
         self.sample = None;
         self.image = None;
     }
@@ -295,9 +300,21 @@ impl Connector {
             m.sample_rows as usize,
             m.blur,
         );
-        if self.last_rect != Some(rect) || self.last_columns != columns {
+        // Ease toward the new edge so a fast scroll fades instead of snapping.
+        if self.shown.len() != columns.len() {
+            self.shown = columns;
+            self.uploaded.clear();
+        } else {
+            blend_toward(&mut self.shown, &columns);
+        }
+        if self.uploaded != self.shown || self.image.is_none() {
             let image = Dib::resize(&mut self.image, width, height)?;
-            fill_gradient_columns(image.pixels()?, width as usize, height as usize, &columns);
+            fill_gradient_columns(
+                image.pixels()?,
+                width as usize,
+                height as usize,
+                &self.shown,
+            );
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
@@ -326,6 +343,7 @@ impl Connector {
                     ULW_ALPHA,
                 )?;
             }
+            self.uploaded = self.shown.clone();
         }
         unsafe {
             let previous = GetWindow(taskbar, GW_HWNDPREV).unwrap_or_default();
@@ -344,7 +362,6 @@ impl Connector {
             SetWindowPos(self.hwnd, after, rect.left, rect.top, width, height, flags)?;
         }
         self.last_rect = Some(rect);
-        self.last_columns = columns;
         Ok(true)
     }
 }
@@ -371,22 +388,28 @@ pub(crate) fn smooth_scanline(
         return Vec::new();
     }
     assert_eq!(raw_bgra.len(), width * rows * 4);
+    // Rows closer to the window edge dominate, so newly scrolled content registers immediately.
     let mut prefix = vec![(0u64, 0u64, 0u64); width + 1];
+    let mut weights = vec![0u64; width + 1];
     for x in 0..width {
         let (mut red, mut green, mut blue) = prefix[x];
+        let mut weight = weights[x];
         for row in 0..rows {
             let at = (row * width + x) * 4;
-            red += u64::from(raw_bgra[at + 2]);
-            green += u64::from(raw_bgra[at + 1]);
-            blue += u64::from(raw_bgra[at]);
+            let w = (row + 1) as u64;
+            red += u64::from(raw_bgra[at + 2]) * w;
+            green += u64::from(raw_bgra[at + 1]) * w;
+            blue += u64::from(raw_bgra[at]) * w;
+            weight += w;
         }
         prefix[x + 1] = (red, green, blue);
+        weights[x + 1] = weight;
     }
     (0..width)
         .map(|x| {
             let start = x.saturating_sub(radius);
             let end = x.saturating_add(radius).saturating_add(1).min(width);
-            let count = ((end - start) * rows) as u64;
+            let count = weights[end] - weights[start];
             let a = prefix[start];
             let b = prefix[end];
             (
@@ -396,6 +419,27 @@ pub(crate) fn smooth_scanline(
             )
         })
         .collect()
+}
+
+/// Exponential ease used for the cross-fade between two sampled edges.
+pub(crate) fn blend_toward(shown: &mut [(u8, u8, u8)], target: &[(u8, u8, u8)]) {
+    fn step(old: u8, new: u8) -> u8 {
+        let diff = f32::from(new) - f32::from(old);
+        if diff.abs() <= 1.0 {
+            return new;
+        }
+        (f32::from(old) + diff * BLEND_STEP)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    }
+    for (slot, &(red, green, blue)) in shown.iter_mut().zip(target) {
+        let (old_red, old_green, old_blue) = *slot;
+        *slot = (
+            step(old_red, red),
+            step(old_green, green),
+            step(old_blue, blue),
+        );
+    }
 }
 
 pub(crate) fn fill_gradient_columns(
@@ -556,6 +600,36 @@ mod tests {
             assert!(!is_docked_above_taskbar(&fullscreen, &bar, &m), "dpi {dpi}");
             assert!(!is_docked_above_taskbar(&floating, &bar, &m), "dpi {dpi}");
         }
+    }
+
+    #[test]
+    fn blending_eases_instead_of_snapping() {
+        let mut shown = vec![(0u8, 0u8, 0u8); 2];
+        let target = [(200u8, 100u8, 50u8); 2];
+        let mut previous = 0u8;
+        let mut frames = 0;
+        while shown[0].0 != target[0].0 {
+            blend_toward(&mut shown, &target);
+            assert!(shown[0].0 >= previous, "blend must move toward the target");
+            previous = shown[0].0;
+            assert_eq!(shown[0], shown[1], "every column animates at the same rate");
+            frames += 1;
+            assert!(frames < 40, "blend must converge, not stall");
+        }
+        assert!(frames > 1, "one frame would be a snap, not a fade");
+    }
+
+    #[test]
+    fn sampled_rows_weight_the_visible_edge() {
+        // Row 0 is farthest from the app edge; the last row is the one the user sees.
+        let far = [[0u8, 0, 0, 255]; 1].concat();
+        // Raw pixels are BGRA, so red lives at offset 2.
+        let near = [[0u8, 0, 255, 255]; 1].concat();
+        let capture = [far, near.clone()].concat();
+        let weighted = smooth_scanline(&capture, 1, 2, 0);
+        assert!(weighted[0].0 > 127, "the edge row must dominate the sample");
+        assert_eq!(weighted[0].2, 0, "the far row must not win");
+        assert_eq!(smooth_scanline(&near, 1, 1, 0), [(255, 0, 0)]);
     }
 
     #[test]

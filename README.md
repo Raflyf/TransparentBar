@@ -37,7 +37,7 @@ Your wallpaper stays visible behind pinned apps and system controls. This framed
 - **Transparent taskbar.** A clear background without blur or color effects.
 - **Maximized-window connector.** An optional soft gradient strip follows the visible bottom edge of a maximized window, preserving different colors across its width and updating as content scrolls. Toggle it on or off from the tray menu. Fullscreen windows hide the strip.
 - **Native Rust.** No webview, browser engine, or bundled UI framework.
-- **Conditional refresh.** Taskbar transparency responds to Windows events. The connector samples a four-pixel-high edge every 120 ms only while a supported maximized window is active, and uploads its gradient only when colors or geometry change. While inactive, an enabled connector checks window eligibility once per second without capturing pixels; disabling it stops that timer.
+- **Conditional refresh.** Taskbar transparency responds to Windows events. The connector samples a four-pixel-high edge every 60 ms only while a supported maximized window is active, weighting the row closest to the window edge and cross-fading between colours, and uploads its gradient only when colors or geometry change. While inactive, an enabled connector checks window eligibility once per second without capturing pixels; disabling it stops that timer.
 - **Optional startup.** Enable or disable launch at sign-in from the tray menu. Off by default.
 - **Release update check.** Checks GitHub Releases for a newer version and notifies you from the system tray, with a manual check option in the tray menu.
 - **Installer or portable.** Install for your account, or extract a ZIP and run it.
