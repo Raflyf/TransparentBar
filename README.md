@@ -84,7 +84,9 @@ The tray menu uses English labels, supports keyboard navigation, and adapts to t
 
 For portable use, keep the executable and its versioned bridge DLL together. If you move the folder after enabling startup, disable and re-enable startup from the new location.
 
-The connector currently supports the primary bottom-docked taskbar with auto-hide off. It samples a thin visible screen band above its own overlay, averages four rows, and smooths nearby columns to reduce text noise. It is a softened approximation of that edge, not a capture of the entire application. Pixels stay in memory and are never saved or uploaded. Unsupported taskbar placements and fullscreen windows hide the connector.
+The connector currently supports the primary bottom-docked taskbar with auto-hide off. It samples a thin visible screen band above its own overlay, averages four rows, and smooths nearby columns to reduce text noise. It is a softened approximation of that edge, not a capture of the entire application. Pixels stay in memory and are never saved or uploaded.
+The connector sizes itself from the monitor DPI of the taskbar and the process runs per-monitor DPI aware, so its geometry and screen sampling stay in the same device pixels at any display scaling.
+ Unsupported taskbar placements and fullscreen windows hide the connector.
 
 ## Compatibility
 

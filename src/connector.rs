@@ -5,23 +5,68 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 use windows::{
-    core::{w, Error, Result, PCWSTR},
+    core::{s, w, Error, Result, PCWSTR},
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
-        System::LibraryLoader::GetModuleHandleW,
+        System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
         UI::{Shell::*, WindowsAndMessaging::*},
     },
 };
 
 const CLASS: PCWSTR = w!("TransparentBar.Connector");
-const SEAM_OVERLAP: i32 = 2;
-const SAMPLE_ROWS: i32 = 4;
-const BLUR_RADIUS: usize = 8;
-const STRIP_HEIGHT: i32 = 42;
+// Base sizes are device pixels at 96 DPI; Metrics scales them per monitor.
+const BASE_SEAM_OVERLAP: i32 = 2;
+const BASE_SAMPLE_ROWS: i32 = 4;
+const BASE_BLUR_RADIUS: i32 = 8;
+const BASE_STRIP_HEIGHT: i32 = 42;
+const BASE_FRAME_OVERHANG: i32 = 14;
+const BASE_EDGE_SLACK: i32 = 4;
 const TOP_ALPHA: f32 = 0.90;
 const FALLOFF: f32 = 1.65;
 static CLASS_READY: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Metrics {
+    pub strip: i32,
+    pub seam: i32,
+    pub sample_rows: i32,
+    pub blur: usize,
+    pub overhang: i32,
+    pub slack: i32,
+}
+
+pub(crate) fn metrics(dpi: u32) -> Metrics {
+    let dpi: i32 = if dpi == 0 { 96 } else { dpi.min(1920) as i32 };
+    let scale = |base: i32| (base * dpi + 48) / 96;
+    Metrics {
+        strip: scale(BASE_STRIP_HEIGHT),
+        seam: scale(BASE_SEAM_OVERLAP),
+        sample_rows: scale(BASE_SAMPLE_ROWS).max(1),
+        blur: scale(BASE_BLUR_RADIUS).max(1) as usize,
+        overhang: scale(BASE_FRAME_OVERHANG),
+        slack: scale(BASE_EDGE_SLACK),
+    }
+}
+
+/// Monitor DPI of a window; GetDpiForWindow needs Windows 10 1607, so it is resolved at runtime.
+fn dpi_for_window(hwnd: HWND) -> u32 {
+    unsafe {
+        if let Ok(user32) = GetModuleHandleW(w!("user32.dll")) {
+            if let Some(address) = GetProcAddress(user32, s!("GetDpiForWindow")) {
+                let get: unsafe extern "system" fn(HWND) -> u32 = std::mem::transmute(address);
+                let dpi = get(hwnd);
+                if dpi != 0 {
+                    return dpi;
+                }
+            }
+        }
+        let screen = GetDC(None);
+        let dpi = GetDeviceCaps(screen, LOGPIXELSX);
+        let _ = ReleaseDC(None, screen);
+        u32::try_from(dpi).unwrap_or(96)
+    }
+}
 
 struct Dib {
     dc: HDC,
@@ -206,21 +251,22 @@ impl Connector {
             GetWindowRect(taskbar, &mut bar)?;
         }
         let width = bar.right - bar.left;
-        let height = STRIP_HEIGHT.min(bar.bottom - bar.top + SEAM_OVERLAP);
-        if width <= 0 || height < 8 || maximised_above(taskbar, &bar).is_none() {
+        let m = metrics(dpi_for_window(taskbar));
+        let height = m.strip.min(bar.bottom - bar.top + m.seam);
+        if width <= 0 || height < 8 || maximised_above(taskbar, &bar, &m).is_none() {
             self.hide();
             return Ok(false);
         }
         let rect = RECT {
             left: bar.left,
-            top: bar.top - SEAM_OVERLAP,
+            top: bar.top - m.seam,
             right: bar.right,
-            bottom: bar.top - SEAM_OVERLAP + height,
+            bottom: bar.top - m.seam + height,
         };
         if self.last_rect.is_some_and(|previous| previous != rect) {
             self.hide(); // The old strip must not overlap a relocated capture row.
         }
-        let sample = Dib::resize(&mut self.sample, width, SAMPLE_ROWS)?;
+        let sample = Dib::resize(&mut self.sample, width, m.sample_rows)?;
         let screen = unsafe { GetDC(None) };
         if screen.is_invalid() {
             return Err(Error::new(
@@ -234,10 +280,10 @@ impl Connector {
                 0,
                 0,
                 width,
-                SAMPLE_ROWS,
+                m.sample_rows,
                 screen,
                 rect.left,
-                sample_top(rect.top),
+                sample_top(rect.top, m.sample_rows),
                 SRCCOPY,
             )
         };
@@ -246,8 +292,8 @@ impl Connector {
         let columns = smooth_scanline(
             sample.pixels()?,
             width as usize,
-            SAMPLE_ROWS as usize,
-            BLUR_RADIUS,
+            m.sample_rows as usize,
+            m.blur,
         );
         if self.last_rect != Some(rect) || self.last_columns != columns {
             let image = Dib::resize(&mut self.image, width, height)?;
@@ -311,8 +357,8 @@ impl Drop for Connector {
     }
 }
 
-fn sample_top(overlay_top: i32) -> i32 {
-    overlay_top - SAMPLE_ROWS
+fn sample_top(overlay_top: i32, rows: i32) -> i32 {
+    overlay_top - rows
 }
 
 pub(crate) fn smooth_scanline(
@@ -388,13 +434,14 @@ pub(crate) fn is_shell_class(class: &str) -> bool {
     )
 }
 
-pub(crate) fn is_docked_above_taskbar(window: &RECT, bar: &RECT) -> bool {
+pub(crate) fn is_docked_above_taskbar(window: &RECT, bar: &RECT, m: &Metrics) -> bool {
     let bar_height = bar.bottom - bar.top;
     if bar_height <= 0 || window.left >= bar.right || window.right <= bar.left {
         return false;
     }
-    let max_frame_overhang = 14.min(bar_height / 2);
-    window.bottom >= bar.top - 4 && window.bottom <= bar.top + max_frame_overhang
+    // A maximized window's invisible resize frame grows with DPI, so the tolerance scales too.
+    let overhang = m.overhang.min(bar_height / 2);
+    window.bottom >= bar.top - m.slack && window.bottom <= bar.top + overhang
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -404,7 +451,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
     DefWindowProcW(hwnd, message, wp, lp)
 }
 
-fn maximised_above(taskbar: HWND, bar: &RECT) -> Option<RECT> {
+fn maximised_above(taskbar: HWND, bar: &RECT, m: &Metrics) -> Option<RECT> {
     unsafe {
         if let Ok(state) = SHQueryUserNotificationState() {
             if matches!(
@@ -430,8 +477,8 @@ fn maximised_above(taskbar: HWND, bar: &RECT) -> Option<RECT> {
             || bar.bottom != info.rcMonitor.bottom
             || bar.left != info.rcMonitor.left
             || bar.right != info.rcMonitor.right
-            || info.rcWork.bottom > bar.top + 14
-            || sample_top(bar.top - SEAM_OVERLAP) < info.rcMonitor.top
+            || info.rcWork.bottom > bar.top + m.overhang
+            || sample_top(bar.top - m.seam, m.sample_rows) < info.rcMonitor.top
         {
             return None;
         }
@@ -442,7 +489,7 @@ fn maximised_above(taskbar: HWND, bar: &RECT) -> Option<RECT> {
         }
         let mut rect = RECT::default();
         GetWindowRect(hwnd, &mut rect).ok()?;
-        is_docked_above_taskbar(&rect, bar).then_some(rect)
+        is_docked_above_taskbar(&rect, bar, m).then_some(rect)
     }
 }
 
@@ -453,8 +500,61 @@ mod tests {
     #[test]
     fn sample_stays_above_overlay_including_negative_coordinates() {
         for top in [1030, 30, -52] {
-            assert_eq!(sample_top(top) + SAMPLE_ROWS, top);
-            assert!(sample_top(top) < top);
+            for dpi in [96, 120, 144, 192] {
+                let rows = metrics(dpi).sample_rows;
+                assert_eq!(sample_top(top, rows) + rows, top);
+                assert!(sample_top(top, rows) < top);
+            }
+        }
+    }
+
+    #[test]
+    fn metrics_follow_display_scaling() {
+        assert_eq!(metrics(0), metrics(96));
+        let base = metrics(96);
+        assert_eq!(
+            (base.strip, base.seam, base.sample_rows, base.blur),
+            (BASE_STRIP_HEIGHT, BASE_SEAM_OVERLAP, BASE_SAMPLE_ROWS, 8)
+        );
+        let mut previous = base;
+        for dpi in [120, 144, 192, 288] {
+            let scaled = metrics(dpi);
+            assert!(scaled.strip > previous.strip && scaled.overhang >= previous.overhang);
+            assert!(scaled.sample_rows >= previous.sample_rows);
+            previous = scaled;
+        }
+        assert_eq!(metrics(192).strip, BASE_STRIP_HEIGHT * 2);
+    }
+
+    #[test]
+    fn maximized_frame_is_docked_at_every_scale_and_fullscreen_is_not() {
+        for dpi in [96u32, 120, 144, 168, 192, 288] {
+            let m = metrics(dpi);
+            let px = |base: i32| base * dpi as i32 / 96;
+            let bar = RECT {
+                left: 0,
+                top: 1000,
+                right: 2560,
+                bottom: 1000 + px(48),
+            };
+            // Windows draws maximized frames about 8 px (at 96 DPI) past the work area.
+            let maximized = RECT {
+                left: -px(8),
+                top: -px(8),
+                right: 2560 + px(8),
+                bottom: bar.top + px(8),
+            };
+            let fullscreen = RECT {
+                bottom: bar.bottom,
+                ..maximized
+            };
+            let floating = RECT {
+                bottom: bar.top - px(60),
+                ..maximized
+            };
+            assert!(is_docked_above_taskbar(&maximized, &bar, &m), "dpi {dpi}");
+            assert!(!is_docked_above_taskbar(&fullscreen, &bar, &m), "dpi {dpi}");
+            assert!(!is_docked_above_taskbar(&floating, &bar, &m), "dpi {dpi}");
         }
     }
 

@@ -596,7 +596,7 @@ fn command(hwnd: HWND, id: usize) -> Result<bool> {
         ABOUT => unsafe {
             MessageBoxW(
                 None,
-                w!("TransparentBar 0.1.8
+                w!("TransparentBar 0.1.9
 Native Rust, Windows 10 and 11 x64.
 Copyright 2026 Rafly Firmansyah.
 MIT License; may be redistributed under license terms. No warranty.
@@ -977,6 +977,23 @@ fn run() -> Result<()> {
     }
 }
 
+/// Per-monitor DPI awareness keeps window geometry and screen capture in the same device pixels
+/// at any scaling. Without it a scaled display samples rows far above the real window edge.
+/// SetProcessDpiAwarenessContext needs Windows 10 1607, so it is resolved at runtime.
+fn enable_dpi_awareness() -> bool {
+    unsafe {
+        if let Ok(user32) = GetModuleHandleW(w!("user32.dll")) {
+            if let Some(address) = GetProcAddress(user32, s!("SetProcessDpiAwarenessContext")) {
+                let set: unsafe extern "system" fn(isize) -> BOOL = std::mem::transmute(address);
+                if set(-4).as_bool() {
+                    return true; // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+                }
+            }
+        }
+        SetProcessDPIAware().as_bool()
+    }
+}
+
 fn diagnose() -> Result<()> {
     protocol::trace("Host.Diagnose start");
     let session = XamlSession::connect(2)?;
@@ -1008,6 +1025,7 @@ fn diagnose() -> Result<()> {
 
 fn main() {
     protocol::trace("Host.Main");
+    enable_dpi_awareness();
     unsafe {
         if let Err(error) = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() {
             show_error(&error);
@@ -1065,6 +1083,25 @@ mod tests {
             assert!(
                 !is_window_timer(window, &foreign, REFRESH_TIMER_ID),
                 "foreign timer was consumed"
+            );
+        }
+    }
+
+    #[test]
+    fn process_requests_per_monitor_v2_dpi_awareness() {
+        type Current = unsafe extern "system" fn() -> isize;
+        type Same = unsafe extern "system" fn(isize, isize) -> BOOL;
+        unsafe {
+            enable_dpi_awareness();
+            let user32 = GetModuleHandleW(w!("user32.dll")).unwrap();
+            let current: Current =
+                GetProcAddress(user32, s!("GetThreadDpiAwarenessContext")).unwrap();
+            let same: Same = std::mem::transmute(
+                GetProcAddress(user32, s!("AreDpiAwarenessContextsEqual")).unwrap(),
+            );
+            assert!(
+                same(current(), -4).as_bool(),
+                "thread is not per-monitor aware v2"
             );
         }
     }
@@ -1186,8 +1223,16 @@ mod tests {
             right: 1920,
             bottom: 1080,
         };
-        assert!(connector::is_docked_above_taskbar(&maximised, &bar));
-        assert!(!connector::is_docked_above_taskbar(&fullscreen, &bar));
+        assert!(connector::is_docked_above_taskbar(
+            &maximised,
+            &bar,
+            &connector::metrics(96)
+        ));
+        assert!(!connector::is_docked_above_taskbar(
+            &fullscreen,
+            &bar,
+            &connector::metrics(96)
+        ));
     }
 
     #[test]
