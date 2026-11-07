@@ -534,7 +534,7 @@ fn command(hwnd: HWND, id: usize) -> Result<bool> {
         ABOUT => unsafe {
             MessageBoxW(
                 None,
-                w!("TransparentBar 0.1.5
+                w!("TransparentBar 0.1.6
 Native Rust, Windows 10 dan 11 x64.
 Copyright 2026 Rafly Firmansyah.
 MIT License; boleh dibagikan sesuai lisensi. Tanpa garansi.
