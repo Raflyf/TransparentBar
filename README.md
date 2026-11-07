@@ -35,6 +35,7 @@ Your wallpaper stays visible behind pinned apps and system controls. This framed
 ## Features
 
 - **Transparent taskbar.** A clear background without blur or color effects.
+- **Maximized-window connector.** An optional soft gradient strip at the top of the taskbar bridges maximized windows so the transition into the transparent bar is less abrupt. Toggle it on or off from the tray menu.
 - **Native Rust.** No webview, browser engine, or bundled UI framework.
 - **Event-driven.** Responds to Windows events instead of continuously polling the desktop.
 - **Optional startup.** Enable or disable launch at sign-in from the tray menu. Off by default.
@@ -72,6 +73,7 @@ Browse [all releases](https://github.com/Raflyf/transparentbar/releases) for ear
 
 | Tray option | Action |
 | --- | --- |
+| **Penyambung taskbar** | Toggle the maximized-window gradient connector strip |
 | **Jalankan saat login** | Toggle startup at Windows sign-in |
 | **Tentang / lisensi** | View version and license information |
 | **Keluar** | Restore the saved appearance and exit |

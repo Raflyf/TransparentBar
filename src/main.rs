@@ -18,6 +18,8 @@ use windows::{
 const NAME: PCWSTR = w!("TransparentBar");
 const WINDOW_CLASS: PCWSTR = w!("TransparentBar.Window");
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
+const SETTINGS_KEY: PCWSTR = w!(r"Software\TransparentBar");
+const CONNECTOR_VALUE: PCWSTR = w!("TaskbarConnector");
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const RECONNECT_MESSAGE: u32 = WM_APP + 2;
 const REFRESH_MESSAGE: u32 = WM_APP + 3;
@@ -26,10 +28,12 @@ const MENU_MESSAGE: u32 = WM_APP + 4;
 const STARTUP: usize = 1;
 const ABOUT: usize = 2;
 const EXIT: usize = 3;
+const CONNECTOR: usize = 4;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const REFRESH_TIMER_ID: usize = 1;
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
+mod connector;
 mod icon;
 mod protocol;
 use protocol::{event_name, InitializeXaml, StatusChannel, BRIDGE_CLSID, BRIDGE_FILE};
@@ -364,6 +368,50 @@ fn set_startup(enabled: bool) -> Result<()> {
     }
 }
 
+fn settings_flag(value: PCWSTR, fallback: bool) -> Result<bool> {
+    let mut data = [0u16; 16];
+    let mut bytes = std::mem::size_of_val(&data) as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            SETTINGS_KEY,
+            value,
+            RRF_RT_REG_DWORD,
+            None,
+            Some(data.as_mut_ptr().cast()),
+            Some(&mut bytes),
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(fallback);
+    }
+    status.ok()?;
+    Ok(unsafe { *(data.as_ptr().cast::<u32>()) } != 0)
+}
+
+fn set_settings_flag(value: PCWSTR, enabled: bool) -> Result<()> {
+    unsafe {
+        let mut key = HKEY::default();
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            SETTINGS_KEY,
+            0,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        )
+        .ok()?;
+        let word: u32 = if enabled { 1 } else { 0 };
+        let bytes = std::slice::from_raw_parts((&word as *const u32).cast::<u8>(), 4);
+        let result = RegSetValueExW(key, value, 0, REG_DWORD, Some(bytes));
+        let _ = RegCloseKey(key);
+        result.ok()
+    }
+}
+
 fn show_error(error: &Error) {
     eprintln!("{error}");
     let text = wide(std::ffi::OsStr::new(&format!(
@@ -401,9 +449,16 @@ fn add_tray(hwnd: HWND, application_icon: HICON) -> Result<()> {
 
 fn menu(hwnd: HWND, point: POINT) -> Result<usize> {
     let enabled = startup_enabled()?;
+    let connector = settings_flag(CONNECTOR_VALUE, true)?;
     unsafe {
         let popup = CreatePopupMenu()?;
         let result = (|| {
+            AppendMenuW(
+                popup,
+                MF_STRING | if connector { MF_CHECKED } else { MF_UNCHECKED },
+                CONNECTOR,
+                w!("Penyambung &taskbar"),
+            )?;
             AppendMenuW(
                 popup,
                 MF_STRING | if enabled { MF_CHECKED } else { MF_UNCHECKED },
@@ -456,11 +511,12 @@ fn schedule(hwnd: HWND, delay_ms: u32) -> Result<()> {
 
 fn command(id: usize) -> Result<bool> {
     match id {
+        CONNECTOR => set_settings_flag(CONNECTOR_VALUE, !settings_flag(CONNECTOR_VALUE, true)?)?,
         STARTUP => set_startup(!startup_enabled()?)?,
         ABOUT => unsafe {
             MessageBoxW(
                 None,
-                w!("TransparentBar 0.1.4
+                w!("TransparentBar 0.1.5
 Native Rust, Windows 10 dan 11 x64.
 Copyright 2026 Rafly Firmansyah.
 MIT License; boleh dibagikan sesuai lisensi. Tanpa garansi.
@@ -511,13 +567,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
 
 unsafe extern "system" fn foreground_changed(
     _: HWINEVENTHOOK,
-    _: u32,
-    _: HWND,
-    _: i32,
-    _: i32,
+    event: u32,
+    target: HWND,
+    id_object: i32,
+    id_child: i32,
     _: u32,
     _: u32,
 ) {
+    if event == EVENT_OBJECT_LOCATIONCHANGE
+        && (id_object != OBJID_WINDOW.0 || id_child != 0 || target != GetForegroundWindow())
+    {
+        return;
+    }
     if let Ok(hwnd) = FindWindowW(WINDOW_CLASS, None) {
         SetTimer(hwnd, REFRESH_TIMER_ID, 100, None);
     }
@@ -566,7 +627,16 @@ fn run() -> Result<()> {
             )?;
             let foreground_hook = SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND,
-                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_MINIMIZEEND,
+                None,
+                Some(foreground_changed),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+            let location_hook = SetWinEventHook(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_LOCATIONCHANGE,
                 None,
                 Some(foreground_changed),
                 0,
@@ -574,6 +644,7 @@ fn run() -> Result<()> {
                 WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
             );
             let mut service: Option<TaskbarService> = None;
+            let mut connector = connector::Connector::create().ok();
             let result = (|| {
                 let mut tray_ready = false;
                 let mut retries = 3u8;
@@ -604,6 +675,11 @@ fn run() -> Result<()> {
                         WM_TIMER if is_refresh_timer(hwnd, &msg) => {
                             // KillTimer leaves queued ticks behind; an already-removed timer is harmless.
                             let _ = KillTimer(hwnd, REFRESH_TIMER_ID);
+                            if let Some(strip) = connector.as_ref() {
+                                // Cosmetic: a failure keeps the taskbar itself working.
+                                let _ = strip
+                                    .update(settings_flag(CONNECTOR_VALUE, true).unwrap_or(true));
+                            }
                             if RESTART.swap(false, Ordering::AcqRel) {
                                 service = None;
                                 generation += 1;
@@ -656,22 +732,42 @@ fn run() -> Result<()> {
                             if msg.message == MENU_MESSAGE || is_tray_menu(notification) {
                                 let mut point = POINT::default();
                                 GetCursorPos(&mut point)?;
-                                if let Err(error) =
-                                    menu(hwnd, point).and_then(command).map(|quit| {
-                                        if quit {
-                                            PostQuitMessage(0);
+                                match menu(hwnd, point) {
+                                    Ok(selected) => match command(selected) {
+                                        Ok(true) => PostQuitMessage(0),
+                                        Ok(false) => {
+                                            if selected == CONNECTOR {
+                                                if let Some(strip) = connector.as_ref() {
+                                                    let _ = strip.update(
+                                                        settings_flag(CONNECTOR_VALUE, true)
+                                                            .unwrap_or(true),
+                                                    );
+                                                }
+                                            }
                                         }
-                                    })
-                                {
-                                    show_error(&error);
+                                        Err(error) => show_error(&error),
+                                    },
+                                    Err(error) => show_error(&error),
                                 }
                             }
                         }
-                        WM_COMMAND | COMMAND_MESSAGE => match command(msg.wParam.0 & 0xffff) {
-                            Ok(true) => break,
-                            Ok(false) => (),
-                            Err(error) => show_error(&error),
-                        },
+                        WM_COMMAND | COMMAND_MESSAGE => {
+                            let selected = msg.wParam.0 & 0xffff;
+                            match command(selected) {
+                                Ok(true) => break,
+                                Ok(false) => {
+                                    if selected == CONNECTOR {
+                                        if let Some(strip) = connector.as_ref() {
+                                            let _ = strip.update(
+                                                settings_flag(CONNECTOR_VALUE, true)
+                                                    .unwrap_or(true),
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => show_error(&error),
+                            }
+                        }
                         _ => {
                             let _ = TranslateMessage(&msg);
                             DispatchMessageW(&msg);
@@ -680,6 +776,7 @@ fn run() -> Result<()> {
                 }
                 Ok(())
             })();
+            drop(connector.take());
             let restore = if let Some(service) = service.take() {
                 service.restore()
             } else {
@@ -694,8 +791,10 @@ fn run() -> Result<()> {
                     ..Default::default()
                 },
             );
-            if !foreground_hook.is_invalid() {
-                let _ = UnhookWinEvent(foreground_hook);
+            for hook in [foreground_hook, location_hook] {
+                if !hook.is_invalid() {
+                    let _ = UnhookWinEvent(hook);
+                }
             }
             let _ = DestroyWindow(hwnd);
             result.and(restore)
@@ -827,5 +926,22 @@ mod tests {
         assert_eq!(std::mem::size_of::<AccentPolicy>(), 16);
         assert_eq!(std::mem::offset_of!(CompositionData, data), 8);
         assert_eq!(std::mem::size_of::<CompositionData>(), 24);
+    }
+
+    #[test]
+    fn connector_gradient_fades_and_premultiplies_alpha() {
+        let mut pixels = vec![0u8; 4 * 5 * 4];
+        connector::fill_gradient(&mut pixels, 4, 5, 200, 100, 50);
+        let top_alpha = pixels[3];
+        assert!(top_alpha > 150);
+        assert_eq!(pixels[0], ((50u32 * u32::from(top_alpha)) / 255) as u8);
+        assert_eq!(pixels[1], ((100u32 * u32::from(top_alpha)) / 255) as u8);
+        assert_eq!(pixels[2], ((200u32 * u32::from(top_alpha)) / 255) as u8);
+        let last = (4 * 4) * 4;
+        assert_eq!(&pixels[last..last + 4], &[0, 0, 0, 0]);
+        assert_eq!(connector::decode_colorref(u32::MAX), (17, 16, 14));
+        assert_eq!(connector::decode_colorref(0x00332211), (0x11, 0x22, 0x33));
+        assert!(connector::is_shell_class("Shell_TrayWnd"));
+        assert!(!connector::is_shell_class("Chrome_WidgetWin_1"));
     }
 }
