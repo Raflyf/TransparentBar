@@ -39,8 +39,9 @@ Your wallpaper stays visible behind pinned apps and system controls. This framed
 - **Native Rust.** No webview, browser engine, or bundled UI framework.
 - **Event-driven.** Responds to Windows events instead of continuously polling the desktop.
 - **Optional startup.** Enable or disable launch at sign-in from the tray menu. Off by default.
+- **Release update check.** Checks GitHub Releases for a newer version and notifies you from the system tray, with a manual check option in the tray menu.
 - **Installer or portable.** Install for your account, or extract a ZIP and run it.
-- **Local only.** No accounts, telemetry, or network requests from the application.
+- **No accounts or telemetry.** Runs locally with no user accounts or analytics; network access is used only to check GitHub Releases for updates.
 
 ## Resource use
 
@@ -75,6 +76,7 @@ Browse [all releases](https://github.com/Raflyf/transparentbar/releases) for ear
 | --- | --- |
 | **Penyambung taskbar** | Toggle the maximized-window gradient connector strip |
 | **Jalankan saat login** | Toggle startup at Windows sign-in |
+| **Cek pembaruan** / **Pembaruan tersedia** | Check GitHub Releases for a newer version, or open the latest release page when an update is found |
 | **Tentang / lisensi** | View version and license information |
 | **Keluar** | Restore the saved appearance and exit |
 

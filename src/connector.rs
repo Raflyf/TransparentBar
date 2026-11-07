@@ -7,15 +7,18 @@ use std::{
 use windows::{
     core::{w, Error, Result, PCWSTR},
     Win32::{
-        Foundation::*, Graphics::Gdi::*, System::LibraryLoader::GetModuleHandleW,
-        UI::WindowsAndMessaging::*,
+        Foundation::*,
+        Graphics::Gdi::*,
+        System::LibraryLoader::GetModuleHandleW,
+        UI::{Shell::*, WindowsAndMessaging::*},
     },
 };
 
 const CLASS: PCWSTR = w!("TransparentBar.Connector");
-const STRIP_HEIGHT: i32 = 28;
-const TOP_ALPHA: f32 = 0.72;
-const FALLOFF: f32 = 2.2;
+const SEAM_OVERLAP: i32 = 2;
+const STRIP_HEIGHT: i32 = 42;
+const TOP_ALPHA: f32 = 0.90;
+const FALLOFF: f32 = 1.65;
 static CLASS_READY: AtomicBool = AtomicBool::new(false);
 
 pub struct Connector {
@@ -82,24 +85,28 @@ impl Connector {
             return Ok(());
         }
         let width = bar.right - bar.left;
-        let height = STRIP_HEIGHT.min(bar.bottom - bar.top);
-        if width <= 0 || height < 8 || maximised_above(bar.top).is_none() {
+        let height = STRIP_HEIGHT.min(bar.bottom - bar.top + SEAM_OVERLAP);
+        if width <= 0 || height < 8 || maximised_above(&bar).is_none() {
             self.hide();
             return Ok(());
         }
         let (red, green, blue) = unsafe {
             let screen = GetDC(None);
-            let sample = GetPixel(screen, bar.left + width / 2, (bar.top - 3).max(0));
+            let sample = GetPixel(screen, bar.left + width / 2, (bar.top - 4).max(0));
             let _ = ReleaseDC(None, screen);
             decode_colorref(sample.0)
         };
         self.paint(width, height, red, green, blue)?;
         unsafe {
+            let insert_after = match GetWindow(taskbar, GW_HWNDPREV) {
+                Ok(prev) if !prev.is_invalid() && prev != self.hwnd => prev,
+                _ => HWND_TOPMOST,
+            };
             SetWindowPos(
                 self.hwnd,
-                HWND_TOPMOST,
+                insert_after,
                 bar.left,
-                bar.top,
+                (bar.top - SEAM_OVERLAP).max(0),
                 width,
                 height,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
@@ -223,12 +230,29 @@ pub(crate) fn is_shell_class(class: &str) -> bool {
     )
 }
 
+pub(crate) fn is_docked_above_taskbar(window: &RECT, bar: &RECT) -> bool {
+    let bar_height = bar.bottom - bar.top;
+    if bar_height <= 0 {
+        return false;
+    }
+    let max_frame_overhang = 14.min(bar_height / 2);
+    window.bottom >= bar.top - 4 && window.bottom <= bar.top + max_frame_overhang
+}
+
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     DefWindowProcW(hwnd, message, wp, lp)
 }
 
-fn maximised_above(taskbar_top: i32) -> Option<RECT> {
+fn maximised_above(bar: &RECT) -> Option<RECT> {
     unsafe {
+        if let Ok(state) = SHQueryUserNotificationState() {
+            if matches!(
+                state,
+                QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE | QUNS_APP
+            ) {
+                return None;
+            }
+        }
         let hwnd = GetForegroundWindow();
         if hwnd.is_invalid() || !IsWindowVisible(hwnd).as_bool() || !IsZoomed(hwnd).as_bool() {
             return None;
@@ -244,7 +268,7 @@ fn maximised_above(taskbar_top: i32) -> Option<RECT> {
         }
         let mut rect = RECT::default();
         GetWindowRect(hwnd, &mut rect).ok()?;
-        if rect.bottom <= taskbar_top - 4 {
+        if !is_docked_above_taskbar(&rect, bar) {
             return None;
         }
         Some(rect)

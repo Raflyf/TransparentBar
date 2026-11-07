@@ -25,10 +25,12 @@ const RECONNECT_MESSAGE: u32 = WM_APP + 2;
 const REFRESH_MESSAGE: u32 = WM_APP + 3;
 const COMMAND_MESSAGE: u32 = WM_APP + 5;
 const MENU_MESSAGE: u32 = WM_APP + 4;
+const UPDATE_MESSAGE: u32 = WM_APP + 6;
 const STARTUP: usize = 1;
 const ABOUT: usize = 2;
 const EXIT: usize = 3;
 const CONNECTOR: usize = 4;
+const UPDATE: usize = 5;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const REFRESH_TIMER_ID: usize = 1;
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -36,6 +38,7 @@ static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 mod connector;
 mod icon;
 mod protocol;
+mod updater;
 use protocol::{event_name, InitializeXaml, StatusChannel, BRIDGE_CLSID, BRIDGE_FILE};
 static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -466,6 +469,14 @@ fn menu(hwnd: HWND, point: POINT) -> Result<usize> {
                 w!("Jalankan saat &login"),
             )?;
             AppendMenuW(popup, MF_SEPARATOR, 0, None)?;
+            if let Some(tag) = updater::available_tag() {
+                let label = wide(std::ffi::OsStr::new(&format!(
+                    "&Pembaruan tersedia ({tag})"
+                )));
+                AppendMenuW(popup, MF_STRING, UPDATE, PCWSTR(label.as_ptr()))?;
+            } else {
+                AppendMenuW(popup, MF_STRING, UPDATE, w!("&Cek pembaruan"))?;
+            }
             AppendMenuW(popup, MF_STRING, ABOUT, w!("&Tentang / lisensi"))?;
             AppendMenuW(popup, MF_STRING, EXIT, w!("&Keluar"))?;
             let _ = SetForegroundWindow(hwnd);
@@ -509,10 +520,17 @@ fn schedule(hwnd: HWND, delay_ms: u32) -> Result<()> {
     }
 }
 
-fn command(id: usize) -> Result<bool> {
+fn command(hwnd: HWND, id: usize) -> Result<bool> {
     match id {
         CONNECTOR => set_settings_flag(CONNECTOR_VALUE, !settings_flag(CONNECTOR_VALUE, true)?)?,
         STARTUP => set_startup(!startup_enabled()?)?,
+        UPDATE => {
+            if updater::available_tag().is_some() {
+                updater::open_release_page(hwnd);
+            } else {
+                updater::check_in_background(hwnd, true, UPDATE_MESSAGE);
+            }
+        }
         ABOUT => unsafe {
             MessageBoxW(
                 None,
@@ -540,6 +558,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
         return LRESULT(0);
     }
     match message {
+        TRAY_MESSAGE if ((lp.0 as u32) & 0xffff) == NIN_BALLOONUSERCLICK => {
+            let _ = PostMessageW(hwnd, TRAY_MESSAGE, wp, lp);
+            LRESULT(0)
+        }
         TRAY_MESSAGE if is_tray_menu((lp.0 as u32) & 0xffff) => {
             let _ = PostMessageW(hwnd, MENU_MESSAGE, wp, lp);
             LRESULT(0)
@@ -647,6 +669,7 @@ fn run() -> Result<()> {
             let mut connector = connector::Connector::create().ok();
             let result = (|| {
                 let mut tray_ready = false;
+                let mut update_checked = false;
                 let mut retries = 3u8;
                 let mut generation = 1u32;
                 let mut readiness = 20u8;
@@ -689,7 +712,17 @@ fn run() -> Result<()> {
                             }
                             if !tray_ready {
                                 match add_tray(hwnd, application_icon.0) {
-                                    Ok(()) => tray_ready = true,
+                                    Ok(()) => {
+                                        tray_ready = true;
+                                        if !update_checked {
+                                            update_checked = true;
+                                            updater::check_in_background(
+                                                hwnd,
+                                                false,
+                                                UPDATE_MESSAGE,
+                                            );
+                                        }
+                                    }
                                     Err(_) if retries > 0 => {
                                         retries -= 1;
                                         schedule(hwnd, 2000)?;
@@ -729,11 +762,16 @@ fn run() -> Result<()> {
                         }
                         TRAY_MESSAGE | MENU_MESSAGE => {
                             let notification = (msg.lParam.0 as u32) & 0xffff;
-                            if msg.message == MENU_MESSAGE || is_tray_menu(notification) {
+                            if msg.message == TRAY_MESSAGE
+                                && notification == NIN_BALLOONUSERCLICK
+                                && updater::available_tag().is_some()
+                            {
+                                updater::open_release_page(hwnd);
+                            } else if msg.message == MENU_MESSAGE || is_tray_menu(notification) {
                                 let mut point = POINT::default();
                                 GetCursorPos(&mut point)?;
                                 match menu(hwnd, point) {
-                                    Ok(selected) => match command(selected) {
+                                    Ok(selected) => match command(hwnd, selected) {
                                         Ok(true) => PostQuitMessage(0),
                                         Ok(false) => {
                                             if selected == CONNECTOR {
@@ -751,9 +789,41 @@ fn run() -> Result<()> {
                                 }
                             }
                         }
+                        UPDATE_MESSAGE => {
+                            let manual = msg.wParam.0 != 0;
+                            match msg.lParam.0 {
+                                1 => {
+                                    if let Some(tag) = updater::available_tag() {
+                                        updater::show_balloon(
+                                            hwnd,
+                                            &format!("Pembaruan tersedia: {tag}"),
+                                            "Klik notifikasi ini atau buka menu tray untuk mengunduh rilis terbaru.",
+                                        );
+                                    }
+                                }
+                                0 if manual => {
+                                    updater::show_balloon(
+                                        hwnd,
+                                        "TransparentBar sudah versi terbaru",
+                                        &format!(
+                                            "Versi v{} adalah rilis terbaru saat ini.",
+                                            updater::CURRENT_VERSION
+                                        ),
+                                    );
+                                }
+                                _ if manual => {
+                                    updater::show_balloon(
+                                        hwnd,
+                                        "Gagal memeriksa pembaruan",
+                                        "Periksa koneksi internet Anda lalu coba lagi dari menu tray.",
+                                    );
+                                }
+                                _ => (),
+                            }
+                        }
                         WM_COMMAND | COMMAND_MESSAGE => {
                             let selected = msg.wParam.0 & 0xffff;
-                            match command(selected) {
+                            match command(hwnd, selected) {
                                 Ok(true) => break,
                                 Ok(false) => {
                                     if selected == CONNECTOR {
@@ -943,5 +1013,43 @@ mod tests {
         assert_eq!(connector::decode_colorref(0x00332211), (0x11, 0x22, 0x33));
         assert!(connector::is_shell_class("Shell_TrayWnd"));
         assert!(!connector::is_shell_class("Chrome_WidgetWin_1"));
+        let bar = RECT {
+            left: 0,
+            top: 1032,
+            right: 1920,
+            bottom: 1080,
+        };
+        let maximised = RECT {
+            left: -8,
+            top: -8,
+            right: 1928,
+            bottom: 1040,
+        };
+        let fullscreen = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert!(connector::is_docked_above_taskbar(&maximised, &bar));
+        assert!(!connector::is_docked_above_taskbar(&fullscreen, &bar));
+    }
+
+    #[test]
+    fn updater_parses_release_tags_and_compares_versions() {
+        assert_eq!(
+            updater::extract_tag_from_location(
+                "https://github.com/Raflyf/TransparentBar/releases/tag/v0.1.6"
+            ),
+            Some("v0.1.6".to_string())
+        );
+        assert_eq!(
+            updater::extract_tag_from_json(r#"{"tag_name": "v0.2.0", "draft": false}"#),
+            Some("v0.2.0".to_string())
+        );
+        assert!(updater::is_newer("v0.1.6", "0.1.5"));
+        assert!(updater::is_newer("v0.2.0", "0.1.5"));
+        assert!(!updater::is_newer("v0.1.5", "0.1.5"));
+        assert!(!updater::is_newer("v0.1.4", "0.1.5"));
     }
 }
