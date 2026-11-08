@@ -37,7 +37,7 @@ Your wallpaper stays visible behind pinned apps and system controls. This framed
 - **Transparent taskbar.** A clear background without blur or color effects.
 - **Maximized-window connector.** An optional soft gradient strip follows the visible bottom edge of a maximized window, preserving different colors across its width and updating as content scrolls. Toggle it on or off from the tray menu. Fullscreen windows hide the strip.
 - **Native Rust.** No webview, browser engine, or bundled UI framework.
-- **Conditional refresh.** Taskbar transparency responds to Windows events. The connector samples a four-pixel-high edge at 60 ms while active, relaxing to 250 ms when settled, with cross-faded colors and automatic pause during display sleep or session lock. While inactive, an enabled connector checks window eligibility once per second without capturing pixels; disabling it stops that timer.
+- **Conditional refresh.** Taskbar transparency responds to Windows events. The connector samples a four-pixel-high edge at 16 ms while active, relaxing to 64 ms when settled, with cross-faded colors and automatic pause during display sleep or session lock. Foreground and location events wake the fast timer so the strip hides promptly when a window closes, restores, or loses focus. While inactive, an enabled connector checks window eligibility once per second without capturing pixels; disabling it stops that timer.
 - **Optional startup.** Enable or disable launch at sign-in from the tray menu. Off by default.
 - **Release update check.** Checks GitHub Releases for a newer version and notifies you from the system tray, with a manual check option in the tray menu.
 - **Installer or portable.** Install for your account, or extract a ZIP and run it.
@@ -59,8 +59,8 @@ These are displayed values at capture time, not a benchmark or an upper limit. C
 
 | Package | Best for |
 | --- | --- |
-| [Windows installer](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-setup.exe) | Start Menu integration and a standard uninstall entry |
-| [Portable ZIP](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-windows-x64.zip) | Running without installation |
+| [Windows installer](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-setup-v0.2.3.exe) | Start Menu integration and a standard uninstall entry |
+| [Portable ZIP](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-windows-x64-v0.2.3.zip) | Running without installation |
 
 **Requires Windows 10 or Windows 11 on an x64 PC.** No administrator access is required for normal use. ARM64 is not supported.
 
@@ -75,6 +75,8 @@ Browse [all releases](https://github.com/Raflyf/transparentbar/releases) for ear
 | Tray option | Action |
 | --- | --- |
 | **Taskbar connector** | Toggle the maximized-window gradient connector strip |
+| **Connector pattern** | Toggle the faint grid pattern on the strip |
+| **Reduce connector animation** | Disable the cross-fade so colors snap to the new edge immediately |
 | **Run at sign-in** | Toggle startup at Windows sign-in |
 | **Check for updates** / **Update available** | Check GitHub Releases for a newer version, or open the latest release page when an update is found |
 | **About / license** | View version and license information |
@@ -84,9 +86,9 @@ The tray menu uses English labels, supports keyboard navigation, and adapts to t
 
 For portable use, keep the executable and its versioned bridge DLL together. If you move the folder after enabling startup, disable and re-enable startup from the new location.
 
-The connector currently supports the primary bottom-docked taskbar with auto-hide off. It samples a thin visible screen band above its own overlay, averages four rows, and smooths nearby columns to reduce text noise. It is a softened approximation of that edge, not a capture of the entire application. Pixels stay in memory and are never saved or uploaded.
+The connector currently supports the primary and secondary bottom-docked taskbars with auto-hide off. It samples a thin visible screen band above its own overlay, weights four rows toward the visible edge, and smooths nearby columns to reduce text noise. It is a softened approximation of that edge, not a capture of the entire application. Pixels stay in memory and are never saved or uploaded.
 The connector sizes itself from the monitor DPI of the taskbar, caps its height at 55% of a thin taskbar, and bounds its width to 1920 px; the process runs per-monitor DPI aware, so its geometry and screen sampling stay in the same device pixels at any display scaling.
- Unsupported taskbar placements and fullscreen windows hide the connector.
+Unsupported taskbar placements and fullscreen windows hide the connector.
 
 ## Compatibility
 
@@ -141,7 +143,7 @@ cargo build --release --locked
 .\build.ps1 -SkipBuild
 ```
 
-The portable package is created in `dist\TransparentBar-windows-x64.zip`. To build the installer, install Inno Setup and compile [setup.iss](https://github.com/Raflyf/transparentbar/blob/main/setup.iss). GitHub Actions builds both packages; version tags publish them to Releases.
+The portable package is created in `dist\TransparentBar-windows-x64-v<version>.zip`. To build the installer, install Inno Setup and compile [setup.iss](https://github.com/Raflyf/transparentbar/blob/main/setup.iss). GitHub Actions builds both packages; version tags publish them to Releases.
 
 GNU toolchain builds are available for development, but the release pipeline uses MSVC to embed Windows executable resources.
 
