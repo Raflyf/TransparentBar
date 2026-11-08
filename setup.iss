@@ -28,7 +28,7 @@ LicenseFile=LICENSE.md
 
 [Files]
 Source: "dist\TransparentBar\transparentbar.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\TransparentBar\transparentbar_bridge-0.2.1.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\TransparentBar\transparentbar_bridge-0.2.2.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "LICENSE.md"; DestDir: "{app}"
 Source: "README.md"; DestDir: "{app}"
 Source: "dist\TransparentBar\BUILD.txt"; DestDir: "{app}"; Flags: ignoreversion
