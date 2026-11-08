@@ -22,7 +22,7 @@ WizardStyle=modern
 SetupIconFile=assets\transparentbar.ico
 UninstallDisplayIcon={app}\transparentbar.exe
 AppMutex=Local\TransparentBar.SingleInstance
-CloseApplications=yes
+CloseApplications=no
 RestartApplications=no
 LicenseFile=LICENSE.md
 
@@ -68,6 +68,26 @@ begin
     begin
       Sleep(100);
       I := I + 1;
+    end;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  AppDir, BridgeDll, OldDll: String;
+begin
+  if CurStep = ssInstall then
+  begin
+    AppDir := ExpandConstant('{app}');
+    BridgeDll := AppDir + '\transparentbar_bridge-0.2.3.dll';
+    OldDll := BridgeDll + '.old';
+    if FileExists(BridgeDll) then
+    begin
+      DeleteFile(OldDll);
+      if not DeleteFile(BridgeDll) then
+      begin
+        RenameFile(BridgeDll, OldDll);
+      end;
     end;
   end;
 end;
