@@ -19,7 +19,7 @@ const CLASS: PCWSTR = w!("TransparentBar.Connector");
 const BASE_SEAM_OVERLAP: i32 = 2;
 const BASE_SAMPLE_ROWS: i32 = 4;
 /// Fraction of the remaining colour gap closed per frame, which produces the fade.
-const BLEND_STEP: f32 = 0.3;
+const BLEND_STEP: f32 = 0.5;
 const BASE_BLUR_RADIUS: i32 = 8;
 const BASE_STRIP_HEIGHT: i32 = 34;
 const BASE_FRAME_OVERHANG: i32 = 14;
@@ -461,7 +461,7 @@ pub(crate) fn smooth_scanline(
         let mut weight = weights[x];
         for row in 0..rows {
             let at = (row * width + x) * 4;
-            let w = (row + 1) as u64;
+            let w = ((row + 1) as u64) * ((row + 1) as u64);
             red += u64::from(raw_bgra[at + 2]) * w;
             green += u64::from(raw_bgra[at + 1]) * w;
             blue += u64::from(raw_bgra[at]) * w;
