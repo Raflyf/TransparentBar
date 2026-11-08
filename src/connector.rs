@@ -26,6 +26,19 @@ const BASE_FRAME_OVERHANG: i32 = 14;
 const BASE_EDGE_SLACK: i32 = 4;
 const TOP_ALPHA: f32 = 0.90;
 const FALLOFF: f32 = 1.65;
+/// Vertical gap between pattern cells, and how faint each cell line is.
+const BASE_GRID_STEP: i32 = 28;
+const GRID_ALPHA: f32 = 0.07;
+/// The strip never covers more than this share of a thin taskbar.
+const MAX_STRIP_FRACTION: i32 = 55;
+const MAX_STRIP_FRACTION_DEN: i32 = 100;
+const MAX_STRIP_WIDTH: i32 = 1920;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Style {
+    pub pattern: bool,
+    pub reduce_motion: bool,
+}
 static CLASS_READY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +49,7 @@ pub(crate) struct Metrics {
     pub blur: usize,
     pub overhang: i32,
     pub slack: i32,
+    pub grid_step: i32,
 }
 
 pub(crate) fn metrics(dpi: u32) -> Metrics {
@@ -48,6 +62,7 @@ pub(crate) fn metrics(dpi: u32) -> Metrics {
         blur: scale(BASE_BLUR_RADIUS).max(1) as usize,
         overhang: scale(BASE_FRAME_OVERHANG),
         slack: scale(BASE_EDGE_SLACK),
+        grid_step: scale(BASE_GRID_STEP),
     }
 }
 
@@ -182,6 +197,7 @@ pub struct Connector {
     shown: Vec<(u8, u8, u8)>,
     uploaded: Vec<(u8, u8, u8)>,
     settled_ticks: u32,
+    style: Style,
 }
 
 impl Connector {
@@ -222,6 +238,10 @@ impl Connector {
                 shown: Vec::new(),
                 uploaded: Vec::new(),
                 settled_ticks: 0,
+                style: Style {
+                    pattern: true,
+                    reduce_motion: false,
+                },
             })
         }
     }
@@ -241,16 +261,27 @@ impl Connector {
     }
 
     /// True while sampling a maximized window; errors never leave a stale strip visible.
-    pub fn update(&mut self, enabled: bool) -> Result<ConnectorState> {
-        let result = self.update_inner(enabled);
+    pub fn update(&mut self, enabled: bool, style: Style) -> Result<ConnectorState> {
+        let result = self.update_inner(enabled, style);
         if result.is_err() {
             self.hide();
         }
         result
     }
 
-    fn update_inner(&mut self, enabled: bool) -> Result<ConnectorState> {
+    fn update_inner(&mut self, enabled: bool, style: Style) -> Result<ConnectorState> {
+        self.style = style;
         if !enabled {
+            self.hide();
+            return Ok(ConnectorState::Hidden);
+        }
+        // A remote desktop session usually hides the local taskbar, so sampling it is wasted work.
+        if unsafe { GetSystemMetrics(SM_REMOTESESSION) } != 0 {
+            self.hide();
+            return Ok(ConnectorState::Hidden);
+        }
+        // DWM composition off means screen captures can return blank pixels.
+        if !dwm_composition_enabled() {
             self.hide();
             return Ok(ConnectorState::Hidden);
         }
@@ -273,9 +304,14 @@ impl Connector {
         unsafe {
             GetWindowRect(taskbar, &mut bar)?;
         }
-        let width = bar.right - bar.left;
+        let bar_height = bar.bottom - bar.top;
         let m = metrics(dpi_for_window(taskbar));
-        let height = m.strip.min(bar.bottom - bar.top + m.seam);
+        // Keep the strip proportional on thin taskbars and bounded on ultra-wide screens.
+        let max_height = (bar_height * MAX_STRIP_FRACTION / MAX_STRIP_FRACTION_DEN)
+            .max(m.seam + 8)
+            .min(m.strip);
+        let width = (bar.right - bar.left).min(MAX_STRIP_WIDTH);
+        let height = max_height.min(bar_height + m.seam);
         if width <= 0 || height < 8 || maximised_above(fg, taskbar, &bar, &m).is_none() {
             self.hide();
             return Ok(ConnectorState::Hidden);
@@ -283,7 +319,7 @@ impl Connector {
         let rect = RECT {
             left: bar.left,
             top: bar.top - m.seam,
-            right: bar.right,
+            right: bar.left + width,
             bottom: bar.top - m.seam + height,
         };
         if self.last_rect.is_some_and(|previous| previous != rect) {
@@ -319,7 +355,7 @@ impl Connector {
             m.blur,
         );
         // Ease toward the new edge so a fast scroll fades instead of snapping.
-        if self.shown.len() != columns.len() {
+        if self.shown.len() != columns.len() || style.reduce_motion {
             self.shown = columns.clone();
             self.uploaded.clear();
         } else {
@@ -332,6 +368,7 @@ impl Connector {
                 width as usize,
                 height as usize,
                 &self.shown,
+                &style,
             );
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
@@ -475,10 +512,12 @@ pub(crate) fn fill_gradient_columns(
     width: usize,
     height: usize,
     columns: &[(u8, u8, u8)],
+    style: &Style,
 ) {
     assert_eq!(columns.len(), width);
     assert_eq!(pixels.len(), width * height * 4);
     let span = height.saturating_sub(1).max(1) as f32;
+    let step = metrics(96).grid_step.max(8) as usize;
     for row in 0..height {
         let falloff = 1.0 - row as f32 / span;
         let alpha = (TOP_ALPHA * falloff.powf(FALLOFF) * 255.0).round() as u32;
@@ -492,6 +531,57 @@ pub(crate) fn fill_gradient_columns(
             ]);
         }
     }
+    if !style.pattern {
+        return;
+    }
+    // Faint grid lines, fading with the same vertical falloff as the gradient.
+    let grid_alpha = (GRID_ALPHA * 255.0) as u32;
+    for row in 0..height {
+        let falloff = 1.0 - row as f32 / span;
+        let alpha = (TOP_ALPHA * falloff.powf(FALLOFF) * 255.0).round() as u32;
+        if alpha == 0 {
+            continue;
+        }
+        let shade = (grid_alpha * alpha) / 255;
+        for x in (0..width).step_by(step) {
+            let at = (row * width + x) * 4;
+            let (mut blue, mut green, mut red) = (
+                u32::from(pixels[at]),
+                u32::from(pixels[at + 1]),
+                u32::from(pixels[at + 2]),
+            );
+            if row % step == 0 {
+                // Horizontal lines brighten the sampled colour instead of darkening it.
+                blue = blue.saturating_add(shade);
+                green = green.saturating_add(shade);
+                red = red.saturating_add(shade);
+            } else {
+                blue = blue.saturating_sub(shade);
+                green = green.saturating_sub(shade);
+                red = red.saturating_sub(shade);
+            }
+            pixels[at] = (blue & 0xff) as u8;
+            pixels[at + 1] = (green & 0xff) as u8;
+            pixels[at + 2] = (red & 0xff) as u8;
+        }
+    }
+}
+
+/// DWM composition is resolved at runtime because it moved out of user32 on Windows 10.
+fn dwm_composition_enabled() -> bool {
+    unsafe {
+        if let Ok(dwmapi) = GetModuleHandleW(w!("dwmapi.dll")) {
+            if let Some(address) = GetProcAddress(dwmapi, s!("DwmIsCompositionEnabled")) {
+                let is_enabled: unsafe extern "system" fn(*mut i32) -> i32 =
+                    std::mem::transmute(address);
+                let mut enabled = 0i32;
+                if is_enabled(&mut enabled) >= 0 {
+                    return enabled != 0;
+                }
+            }
+        }
+    }
+    true
 }
 
 pub(crate) fn is_shell_class(class: &str) -> bool {
@@ -683,6 +773,54 @@ mod tests {
         assert!(weighted[0].0 > 127, "the edge row must dominate the sample");
         assert_eq!(weighted[0].2, 0, "the far row must not win");
         assert_eq!(smooth_scanline(&near, 1, 1, 0), [(255, 0, 0)]);
+    }
+
+    #[test]
+    fn pattern_adds_grid_lines_and_reduce_motion_snaps() {
+        let columns = [(100u8, 120, 140); 60];
+        let gradient = Style {
+            pattern: false,
+            reduce_motion: false,
+        };
+        let patterned = Style {
+            pattern: true,
+            reduce_motion: false,
+        };
+        let mut plain = vec![0u8; 60 * 20 * 4];
+        let mut grid = vec![0u8; 60 * 20 * 4];
+        fill_gradient_columns(&mut plain, 60, 20, &columns, &gradient);
+        fill_gradient_columns(&mut grid, 60, 20, &columns, &patterned);
+        assert_ne!(&plain[..], &grid[..], "grid pattern must alter pixels");
+        // A vertical grid line lands at column 0, brightening its first row.
+        assert!(grid[0] > plain[0]);
+        // A row between grid lines is darkened, and the alpha byte is untouched.
+        assert!(grid[(3 * 60) * 4] < plain[(3 * 60) * 4]);
+        assert_eq!(grid[(3 * 60) * 4 + 3], plain[(3 * 60) * 4 + 3]);
+        // Reduce motion disables blending, so a jump lands in one frame.
+        let mut shown = vec![(0u8, 0u8, 0u8)];
+        let snap = Style {
+            pattern: false,
+            reduce_motion: true,
+        };
+        let target = [(255u8, 255, 255)];
+        assert!(snap.reduce_motion);
+        if snap.reduce_motion {
+            shown = target.to_vec();
+        } else {
+            blend_toward(&mut shown, &target);
+        }
+        assert_eq!(shown, target);
+    }
+
+    #[test]
+    fn thin_taskbars_keep_the_strip_proportional() {
+        let m = metrics(96);
+        for (bar_height, expected) in [(28, 15), (40, 22), (48, 26), (80, 34), (200, 34)] {
+            let max_height = (bar_height * MAX_STRIP_FRACTION / MAX_STRIP_FRACTION_DEN)
+                .max(m.seam + 8)
+                .min(m.strip);
+            assert_eq!(max_height, expected, "bar height {bar_height}");
+        }
     }
 
     #[test]

@@ -20,6 +20,8 @@ const WINDOW_CLASS: PCWSTR = w!("TransparentBar.Window");
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 const SETTINGS_KEY: PCWSTR = w!(r"Software\TransparentBar");
 const CONNECTOR_VALUE: PCWSTR = w!("TaskbarConnector");
+const PATTERN_VALUE: PCWSTR = w!("TaskbarPattern");
+const REDUCE_MOTION_VALUE: PCWSTR = w!("ReduceMotion");
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const RECONNECT_MESSAGE: u32 = WM_APP + 2;
 const REFRESH_MESSAGE: u32 = WM_APP + 3;
@@ -35,6 +37,8 @@ const ABOUT: usize = 2;
 const EXIT: usize = 3;
 const CONNECTOR: usize = 4;
 const UPDATE: usize = 5;
+const PATTERN: usize = 6;
+const REDUCE_MOTION: usize = 7;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const REFRESH_TIMER_ID: usize = 1;
 const CONNECTOR_TIMER_ID: usize = 2;
@@ -506,6 +510,25 @@ fn menu(hwnd: HWND, point: POINT) -> Result<usize> {
                 STARTUP,
                 w!("Run at &sign-in"),
             )?;
+            let pattern = settings_flag(PATTERN_VALUE, true)?;
+            AppendMenuW(
+                popup,
+                MF_STRING | if pattern { MF_CHECKED } else { MF_UNCHECKED },
+                PATTERN,
+                w!("Connector &pattern"),
+            )?;
+            let reduce_motion = settings_flag(REDUCE_MOTION_VALUE, false)?;
+            AppendMenuW(
+                popup,
+                MF_STRING
+                    | if reduce_motion {
+                        MF_CHECKED
+                    } else {
+                        MF_UNCHECKED
+                    },
+                REDUCE_MOTION,
+                w!("&Reduce connector animation"),
+            )?;
             AppendMenuW(popup, MF_SEPARATOR, 0, None)?;
             if let Some(tag) = updater::available_tag() {
                 let label = wide(std::ffi::OsStr::new(&format!("&Update available ({tag})")));
@@ -559,6 +582,13 @@ fn connector_interval(enabled: bool, state: connector::ConnectorState) -> Option
     }
 }
 
+fn connector_style() -> connector::Style {
+    connector::Style {
+        pattern: settings_flag(PATTERN_VALUE, true).unwrap_or(true),
+        reduce_motion: settings_flag(REDUCE_MOTION_VALUE, false).unwrap_or(false),
+    }
+}
+
 fn update_connector(
     hwnd: HWND,
     strip: &mut Option<connector::Connector>,
@@ -578,9 +608,10 @@ fn update_connector(
         }
         return;
     }
+    let style = connector_style();
     let state = strip
         .as_mut()
-        .and_then(|s| s.update(enabled).ok())
+        .and_then(|s| s.update(enabled, style).ok())
         .unwrap_or(connector::ConnectorState::Hidden);
     let next = connector_interval(enabled && strip.is_some(), state);
     if next != *interval {
@@ -608,6 +639,11 @@ fn schedule(hwnd: HWND, delay_ms: u32) -> Result<()> {
 fn command(hwnd: HWND, id: usize) -> Result<bool> {
     match id {
         CONNECTOR => set_settings_flag(CONNECTOR_VALUE, !settings_flag(CONNECTOR_VALUE, true)?)?,
+        PATTERN => set_settings_flag(PATTERN_VALUE, !settings_flag(PATTERN_VALUE, true)?)?,
+        REDUCE_MOTION => set_settings_flag(
+            REDUCE_MOTION_VALUE,
+            !settings_flag(REDUCE_MOTION_VALUE, false)?,
+        )?,
         STARTUP => set_startup(!startup_enabled()?)?,
         UPDATE => {
             if updater::available_tag().is_some() {
@@ -619,7 +655,7 @@ fn command(hwnd: HWND, id: usize) -> Result<bool> {
         ABOUT => unsafe {
             MessageBoxW(
                 None,
-                w!("TransparentBar 0.2.1
+                w!("TransparentBar 0.2.2
 Native Rust, Windows 10 and 11 x64.
 Copyright 2026 Rafly Firmansyah.
 MIT License; may be redistributed under license terms. No warranty.
@@ -950,6 +986,15 @@ fn run() -> Result<()> {
                                                     &mut connector_timer,
                                                 );
                                             }
+                                            if selected == PATTERN || selected == REDUCE_MOTION {
+                                                update_connector(
+                                                    hwnd,
+                                                    &mut connector,
+                                                    connector_enabled,
+                                                    paused,
+                                                    &mut connector_timer,
+                                                );
+                                            }
                                         }
                                         Err(error) => show_error(&error),
                                     },
@@ -1016,6 +1061,15 @@ fn run() -> Result<()> {
                                     if selected == CONNECTOR {
                                         connector_enabled =
                                             settings_flag(CONNECTOR_VALUE, true).unwrap_or(false);
+                                        update_connector(
+                                            hwnd,
+                                            &mut connector,
+                                            connector_enabled,
+                                            paused,
+                                            &mut connector_timer,
+                                        );
+                                    }
+                                    if selected == PATTERN || selected == REDUCE_MOTION {
                                         update_connector(
                                             hwnd,
                                             &mut connector,
@@ -1258,7 +1312,16 @@ mod tests {
         let colors = connector::smooth_scanline(&capture, 3, 2, 0);
         assert_eq!(colors, [(10, 20, 30), (160, 180, 200), (100, 80, 60)]);
         let mut pixels = vec![0; 3 * 4 * 4];
-        connector::fill_gradient_columns(&mut pixels, 3, 4, &colors);
+        connector::fill_gradient_columns(
+            &mut pixels,
+            3,
+            4,
+            &colors,
+            &connector::Style {
+                pattern: false,
+                reduce_motion: false,
+            },
+        );
         assert_ne!(&pixels[0..4], &pixels[4..8]);
         assert_ne!(&pixels[4..8], &pixels[8..12]);
         assert!(pixels[3 * 3 * 4..].iter().all(|&byte| byte == 0));
@@ -1307,7 +1370,16 @@ mod tests {
     #[test]
     fn connector_gradient_fades_and_premultiplies_alpha() {
         let mut pixels = vec![0u8; 4 * 5 * 4];
-        connector::fill_gradient_columns(&mut pixels, 4, 5, &[(200, 100, 50); 4]);
+        connector::fill_gradient_columns(
+            &mut pixels,
+            4,
+            5,
+            &[(200, 100, 50); 4],
+            &connector::Style {
+                pattern: false,
+                reduce_motion: false,
+            },
+        );
         let top_alpha = pixels[3];
         assert!(top_alpha > 150);
         assert_eq!(pixels[0], ((50u32 * u32::from(top_alpha)) / 255) as u8);
