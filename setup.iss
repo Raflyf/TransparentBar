@@ -50,8 +50,6 @@ Filename: "{app}\transparentbar.exe"; Description: "Launch TransparentBar"; Flag
 [Code]
 function FindWindow(LpClassName, LpWindowName: String): HWND;
   external 'user32.dll stdcall';
-function PostMessage(HWnd: HWND; Msg: UINT; wParam: WPARAM; lParam: LPARAM): BOOL;
-  external 'user32.dll stdcall';
 
 { Close the running instance gracefully so the app restores the saved
   taskbar appearance and releases its files before Setup copies over them.
