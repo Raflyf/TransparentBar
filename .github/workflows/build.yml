@@ -68,7 +68,8 @@ jobs:
         env:
           WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: $setupExe = (Get-ChildItem dist/*setup*.exe | Select-Object -First 1).FullName
+        run: |
+          $setupExe = (Get-ChildItem dist/*setup*.exe | Select-Object -First 1).FullName
           ./sign.ps1 -Files $setupExe
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
