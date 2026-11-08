@@ -30,7 +30,7 @@ const MENU_MESSAGE: u32 = WM_APP + 4;
 const UPDATE_MESSAGE: u32 = WM_APP + 6;
 const POWER_PAUSE_MESSAGE: u32 = WM_APP + 7;
 const POWER_RESUME_MESSAGE: u32 = WM_APP + 8;
-const CONNECTOR_FAST_MS: u32 = 60;
+const CONNECTOR_FAST_MS: u32 = 16;
 const CONNECTOR_SETTLED_MS: u32 = 250;
 const STARTUP: usize = 1;
 const ABOUT: usize = 2;
@@ -1281,7 +1281,7 @@ mod tests {
         }
         assert_eq!(
             connector_interval(true, connector::ConnectorState::Active),
-            Some(60)
+            Some(16)
         );
         assert_eq!(
             connector_interval(true, connector::ConnectorState::Settled),
