@@ -74,7 +74,9 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: TransparentBar-windows-x64
-          path: dist/
+          path: |
+            dist/*.zip
+            dist/*.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -95,4 +97,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" dist/* --title "TransparentBar $RELEASE_TAG" --verify-tag --notes-file "release-notes/$RELEASE_TAG.md"
+        run: gh release create "$RELEASE_TAG" dist/*.zip dist/*.exe --title "TransparentBar $RELEASE_TAG" --verify-tag --notes-file "release-notes/$RELEASE_TAG.md"
