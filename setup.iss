@@ -48,27 +48,38 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Filename: "{app}\transparentbar.exe"; Description: "Launch TransparentBar"; Flags: nowait postinstall skipifsilent
 
 [Code]
-function FindWindow(LpClassName, LpWindowName: String): HWND;
-  external 'user32.dll stdcall';
+function PostMessage(hWnd: HWND; Msg: Cardinal; wParam: LongInt; lParam: LongInt): Boolean;
+external 'PostMessageW@user32.dll stdcall';
 
-{ Close the running instance gracefully so the app restores the saved
-  taskbar appearance and releases its files before Setup copies over them.
-  Bounded wait; CloseApplications stays as a fallback if the close fails. }
-function InitializeSetup(): Boolean;
+const
+  WM_CLOSE = $0010;
+
+procedure CloseRunningInstance();
 var
   H: HWND;
   I: Integer;
 begin
-  H := FindWindow('TransparentBar.Window', '');
+  H := FindWindowByClassName('TransparentBar.Window');
   if H <> 0 then
   begin
     PostMessage(H, WM_CLOSE, 0, 0);
     I := 0;
-    while (FindWindow('TransparentBar.Window', '') <> 0) and (I < 50) do
+    while (FindWindowByClassName('TransparentBar.Window') <> 0) and (I < 50) do
     begin
-      Delay(100);
+      Sleep(100);
       I := I + 1;
     end;
   end;
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  CloseRunningInstance();
+  Result := True;
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  CloseRunningInstance();
   Result := True;
 end;
