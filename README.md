@@ -68,7 +68,7 @@ Browse [all releases](https://github.com/Raflyf/transparentbar/releases) for ear
 
 ## Getting started
 
-1. Download the installer or extract the entire portable ZIP to a permanent folder.
+1. Download the installer or extract the entire portable ZIP to a permanent folder. The installer closes the running instance automatically (restoring the saved appearance first), then starts the new version when finished.
 2. Close any other taskbar customization tools, then open TransparentBar.
 3. Click its icon in the system tray near the clock. If hidden, open the tray overflow menu.
 
