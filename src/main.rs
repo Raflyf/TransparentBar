@@ -26,6 +26,10 @@ const REFRESH_MESSAGE: u32 = WM_APP + 3;
 const COMMAND_MESSAGE: u32 = WM_APP + 5;
 const MENU_MESSAGE: u32 = WM_APP + 4;
 const UPDATE_MESSAGE: u32 = WM_APP + 6;
+const POWER_PAUSE_MESSAGE: u32 = WM_APP + 7;
+const POWER_RESUME_MESSAGE: u32 = WM_APP + 8;
+const CONNECTOR_FAST_MS: u32 = 60;
+const CONNECTOR_SETTLED_MS: u32 = 250;
 const STARTUP: usize = 1;
 const ABOUT: usize = 2;
 const EXIT: usize = 3;
@@ -34,7 +38,6 @@ const UPDATE: usize = 5;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const REFRESH_TIMER_ID: usize = 1;
 const CONNECTOR_TIMER_ID: usize = 2;
-const CONNECTOR_REFRESH_MS: u32 = 60;
 const CONNECTOR_IDLE_MS: u32 = 1000;
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -469,7 +472,10 @@ fn add_tray(hwnd: HWND, application_icon: HICON) -> Result<()> {
             hIcon: application_icon,
             ..Default::default()
         };
-        let tip = wide(std::ffi::OsStr::new("TransparentBar - transparent taskbar"));
+        let tip = wide(std::ffi::OsStr::new(concat!(
+            "TransparentBar v",
+            env!("CARGO_PKG_VERSION")
+        )));
         icon.szTip[..tip.len()].copy_from_slice(&tip);
         if !Shell_NotifyIconW(NIM_ADD, &icon).as_bool() {
             return Err(Error::new(E_FAIL, "Explorer has not accepted the tray icon yet. Wait until the taskbar is ready, then reopen the application."));
@@ -542,31 +548,48 @@ fn is_window_timer(hwnd: HWND, message: &MSG, id: usize) -> bool {
         && message.lParam.0 == 0
 }
 
-fn connector_interval(enabled: bool, active: bool) -> Option<u32> {
-    enabled.then_some(if active {
-        CONNECTOR_REFRESH_MS
-    } else {
-        CONNECTOR_IDLE_MS
-    })
+fn connector_interval(enabled: bool, state: connector::ConnectorState) -> Option<u32> {
+    if !enabled {
+        return None;
+    }
+    match state {
+        connector::ConnectorState::Active => Some(CONNECTOR_FAST_MS),
+        connector::ConnectorState::Settled => Some(CONNECTOR_SETTLED_MS),
+        connector::ConnectorState::Hidden => Some(CONNECTOR_IDLE_MS),
+    }
 }
 
 fn update_connector(
     hwnd: HWND,
     strip: &mut Option<connector::Connector>,
     enabled: bool,
+    paused: bool,
     interval: &mut Option<u32>,
 ) {
-    let active = strip
+    if paused {
+        if let Some(s) = strip.as_mut() {
+            s.hide();
+        }
+        if interval.is_some() {
+            unsafe {
+                let _ = KillTimer(hwnd, CONNECTOR_TIMER_ID);
+            }
+            *interval = None;
+        }
+        return;
+    }
+    let state = strip
         .as_mut()
-        .is_some_and(|strip| strip.update(enabled).unwrap_or(false));
-    let next = connector_interval(enabled && strip.is_some(), active);
+        .and_then(|s| s.update(enabled).ok())
+        .unwrap_or(connector::ConnectorState::Hidden);
+    let next = connector_interval(enabled && strip.is_some(), state);
     if next != *interval {
         unsafe {
             let _ = KillTimer(hwnd, CONNECTOR_TIMER_ID);
             *interval = next.filter(|&ms| SetTimer(hwnd, CONNECTOR_TIMER_ID, ms, None) != 0);
             if next.is_some() && interval.is_none() {
-                if let Some(strip) = strip {
-                    strip.hide();
+                if let Some(s) = strip {
+                    s.hide();
                 }
                 protocol::trace("Connector timer could not be created; strip hidden.");
             }
@@ -596,7 +619,7 @@ fn command(hwnd: HWND, id: usize) -> Result<bool> {
         ABOUT => unsafe {
             MessageBoxW(
                 None,
-                w!("TransparentBar 0.2.0
+                w!("TransparentBar 0.2.1
 Native Rust, Windows 10 and 11 x64.
 Copyright 2026 Rafly Firmansyah.
 MIT License; may be redistributed under license terms. No warranty.
@@ -611,6 +634,27 @@ Startup settings apply to the current Windows user account only."),
         _ => (),
     }
     Ok(false)
+}
+
+unsafe fn register_session_notification(hwnd: HWND) -> Option<HMODULE> {
+    if let Ok(module) = LoadLibraryW(w!("wtsapi32.dll")) {
+        if let Some(proc) = GetProcAddress(module, s!("WTSRegisterSessionNotification")) {
+            let register: unsafe extern "system" fn(HWND, u32) -> BOOL = std::mem::transmute(proc);
+            if register(hwnd, 0).as_bool() {
+                return Some(module);
+            }
+        }
+        let _ = FreeLibrary(module);
+    }
+    None
+}
+
+unsafe fn unregister_session_notification(hwnd: HWND, module: HMODULE) {
+    if let Some(proc) = GetProcAddress(module, s!("WTSUnRegisterSessionNotification")) {
+        let unregister: unsafe extern "system" fn(HWND) -> BOOL = std::mem::transmute(proc);
+        let _ = unregister(hwnd);
+    }
+    let _ = FreeLibrary(module);
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -630,6 +674,24 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
         }
         WM_COMMAND => {
             let _ = PostMessageW(hwnd, COMMAND_MESSAGE, wp, lp);
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            let event = wp.0 as u32;
+            if event == PBT_APMSUSPEND {
+                let _ = PostMessageW(hwnd, POWER_PAUSE_MESSAGE, WPARAM(0), LPARAM(0));
+            } else if event == PBT_APMRESUMEAUTOMATIC || event == PBT_APMRESUMESUSPEND {
+                let _ = PostMessageW(hwnd, POWER_RESUME_MESSAGE, WPARAM(0), LPARAM(0));
+            }
+            LRESULT(1)
+        }
+        WM_WTSSESSION_CHANGE => {
+            let event = wp.0 as u32;
+            if event == WTS_SESSION_LOCK {
+                let _ = PostMessageW(hwnd, POWER_PAUSE_MESSAGE, WPARAM(0), LPARAM(0));
+            } else if event == WTS_SESSION_UNLOCK {
+                let _ = PostMessageW(hwnd, POWER_RESUME_MESSAGE, WPARAM(0), LPARAM(0));
+            }
             LRESULT(0)
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_THEMECHANGED => {
@@ -730,6 +792,8 @@ fn run() -> Result<()> {
             let mut service: Option<TaskbarService> = None;
             let mut connector = connector::Connector::create().ok();
             let mut connector_timer = None;
+            let session_module = register_session_notification(hwnd);
+            let mut paused = false;
             let result = (|| {
                 let mut connector_enabled = settings_flag(CONNECTOR_VALUE, true)?;
                 let mut tray_ready = false;
@@ -748,6 +812,27 @@ fn run() -> Result<()> {
                         break;
                     }
                     match msg.message {
+                        POWER_PAUSE_MESSAGE => {
+                            paused = true;
+                            update_connector(
+                                hwnd,
+                                &mut connector,
+                                connector_enabled,
+                                paused,
+                                &mut connector_timer,
+                            );
+                        }
+                        POWER_RESUME_MESSAGE => {
+                            paused = false;
+                            update_connector(
+                                hwnd,
+                                &mut connector,
+                                connector_enabled,
+                                paused,
+                                &mut connector_timer,
+                            );
+                            schedule(hwnd, 500)?;
+                        }
                         RECONNECT_MESSAGE => {
                             service = None;
                             generation += 1;
@@ -767,6 +852,7 @@ fn run() -> Result<()> {
                                     hwnd,
                                     &mut connector,
                                     connector_enabled,
+                                    paused,
                                     &mut connector_timer,
                                 );
                             }
@@ -778,6 +864,7 @@ fn run() -> Result<()> {
                                 hwnd,
                                 &mut connector,
                                 connector_enabled,
+                                paused,
                                 &mut connector_timer,
                             );
                             if RESTART.swap(false, Ordering::AcqRel) {
@@ -859,6 +946,7 @@ fn run() -> Result<()> {
                                                     hwnd,
                                                     &mut connector,
                                                     connector_enabled,
+                                                    paused,
                                                     &mut connector_timer,
                                                 );
                                             }
@@ -932,6 +1020,7 @@ fn run() -> Result<()> {
                                             hwnd,
                                             &mut connector,
                                             connector_enabled,
+                                            paused,
                                             &mut connector_timer,
                                         );
                                     }
@@ -949,6 +1038,9 @@ fn run() -> Result<()> {
             })();
             let _ = KillTimer(hwnd, CONNECTOR_TIMER_ID);
             let _ = KillTimer(hwnd, REFRESH_TIMER_ID);
+            if let Some(module) = session_module {
+                unregister_session_notification(hwnd, module);
+            }
             drop(connector.take());
             let restore = if let Some(service) = service.take() {
                 service.restore()
@@ -1133,10 +1225,30 @@ mod tests {
         ] {
             assert!(!is_window_timer(window, &foreign, CONNECTOR_TIMER_ID));
         }
-        assert_eq!(connector_interval(true, true), Some(60));
-        assert_eq!(connector_interval(true, false), Some(1000));
-        assert_eq!(connector_interval(false, true), None);
-        assert_eq!(connector_interval(false, false), None);
+        assert_eq!(
+            connector_interval(true, connector::ConnectorState::Active),
+            Some(60)
+        );
+        assert_eq!(
+            connector_interval(true, connector::ConnectorState::Settled),
+            Some(250)
+        );
+        assert_eq!(
+            connector_interval(true, connector::ConnectorState::Hidden),
+            Some(1000)
+        );
+        assert_eq!(
+            connector_interval(false, connector::ConnectorState::Active),
+            None
+        );
+        assert_eq!(
+            connector_interval(false, connector::ConnectorState::Settled),
+            None
+        );
+        assert_eq!(
+            connector_interval(false, connector::ConnectorState::Hidden),
+            None
+        );
     }
 
     #[test]

@@ -167,6 +167,13 @@ impl Drop for Dib {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectorState {
+    Active,
+    Settled,
+    Hidden,
+}
+
 pub struct Connector {
     hwnd: HWND,
     sample: Option<Dib>,
@@ -174,6 +181,7 @@ pub struct Connector {
     last_rect: Option<RECT>,
     shown: Vec<(u8, u8, u8)>,
     uploaded: Vec<(u8, u8, u8)>,
+    settled_ticks: u32,
 }
 
 impl Connector {
@@ -213,6 +221,7 @@ impl Connector {
                 last_rect: None,
                 shown: Vec::new(),
                 uploaded: Vec::new(),
+                settled_ticks: 0,
             })
         }
     }
@@ -226,12 +235,13 @@ impl Connector {
         self.last_rect = None;
         self.shown.clear();
         self.uploaded.clear();
+        self.settled_ticks = 0;
         self.sample = None;
         self.image = None;
     }
 
     /// True while sampling a maximized window; errors never leave a stale strip visible.
-    pub fn update(&mut self, enabled: bool) -> Result<bool> {
+    pub fn update(&mut self, enabled: bool) -> Result<ConnectorState> {
         let result = self.update_inner(enabled);
         if result.is_err() {
             self.hide();
@@ -239,16 +249,24 @@ impl Connector {
         result
     }
 
-    fn update_inner(&mut self, enabled: bool) -> Result<bool> {
+    fn update_inner(&mut self, enabled: bool) -> Result<ConnectorState> {
         if !enabled {
             self.hide();
-            return Ok(false);
+            return Ok(ConnectorState::Hidden);
         }
-        let taskbar = match unsafe { FindWindowW(w!("Shell_TrayWnd"), None) } {
-            Ok(hwnd) if !hwnd.is_invalid() => hwnd,
-            _ => {
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.is_invalid()
+            || !unsafe { IsWindowVisible(fg).as_bool() }
+            || !unsafe { IsZoomed(fg).as_bool() }
+        {
+            self.hide();
+            return Ok(ConnectorState::Hidden);
+        }
+        let taskbar = match find_docked_taskbar(fg) {
+            Some(hwnd) => hwnd,
+            None => {
                 self.hide();
-                return Ok(false);
+                return Ok(ConnectorState::Hidden);
             }
         };
         let mut bar = RECT::default();
@@ -258,9 +276,9 @@ impl Connector {
         let width = bar.right - bar.left;
         let m = metrics(dpi_for_window(taskbar));
         let height = m.strip.min(bar.bottom - bar.top + m.seam);
-        if width <= 0 || height < 8 || maximised_above(taskbar, &bar, &m).is_none() {
+        if width <= 0 || height < 8 || maximised_above(fg, taskbar, &bar, &m).is_none() {
             self.hide();
-            return Ok(false);
+            return Ok(ConnectorState::Hidden);
         }
         let rect = RECT {
             left: bar.left,
@@ -302,7 +320,7 @@ impl Connector {
         );
         // Ease toward the new edge so a fast scroll fades instead of snapping.
         if self.shown.len() != columns.len() {
-            self.shown = columns;
+            self.shown = columns.clone();
             self.uploaded.clear();
         } else {
             blend_toward(&mut self.shown, &columns);
@@ -361,8 +379,18 @@ impl Connector {
             };
             SetWindowPos(self.hwnd, after, rect.left, rect.top, width, height, flags)?;
         }
+        let changing = self.shown != columns || self.uploaded != self.shown;
+        if changing {
+            self.settled_ticks = 0;
+        } else {
+            self.settled_ticks = self.settled_ticks.saturating_add(1);
+        }
         self.last_rect = Some(rect);
-        Ok(true)
+        if self.settled_ticks > 20 {
+            Ok(ConnectorState::Settled)
+        } else {
+            Ok(ConnectorState::Active)
+        }
     }
 }
 
@@ -495,7 +523,36 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
     DefWindowProcW(hwnd, message, wp, lp)
 }
 
-fn maximised_above(taskbar: HWND, bar: &RECT, m: &Metrics) -> Option<RECT> {
+pub(crate) fn find_docked_taskbar(fg: HWND) -> Option<HWND> {
+    unsafe {
+        let fg_monitor = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
+        if fg_monitor.is_invalid() {
+            return None;
+        }
+        // Primary bottom taskbar
+        if let Ok(primary) = FindWindowW(w!("Shell_TrayWnd"), None) {
+            if !primary.is_invalid()
+                && MonitorFromWindow(primary, MONITOR_DEFAULTTONULL) == fg_monitor
+            {
+                return Some(primary);
+            }
+        }
+        // Secondary taskbar on multi-monitor setups
+        let mut child = HWND::default();
+        while let Ok(next) = FindWindowExW(None, child, w!("Shell_SecondaryTrayWnd"), None) {
+            if next.is_invalid() {
+                break;
+            }
+            if MonitorFromWindow(next, MONITOR_DEFAULTTONULL) == fg_monitor {
+                return Some(next);
+            }
+            child = next;
+        }
+        None
+    }
+}
+
+fn maximised_above(fg: HWND, taskbar: HWND, bar: &RECT, m: &Metrics) -> Option<RECT> {
     unsafe {
         if let Ok(state) = SHQueryUserNotificationState() {
             if matches!(
@@ -505,12 +562,8 @@ fn maximised_above(taskbar: HWND, bar: &RECT, m: &Metrics) -> Option<RECT> {
                 return None;
             }
         }
-        let hwnd = GetForegroundWindow();
-        if hwnd.is_invalid() || !IsWindowVisible(hwnd).as_bool() || !IsZoomed(hwnd).as_bool() {
-            return None;
-        }
         let monitor = MonitorFromWindow(taskbar, MONITOR_DEFAULTTONULL);
-        if monitor.is_invalid() || MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) != monitor {
+        if monitor.is_invalid() || MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) != monitor {
             return None;
         }
         let mut info = MONITORINFO {
@@ -527,12 +580,12 @@ fn maximised_above(taskbar: HWND, bar: &RECT, m: &Metrics) -> Option<RECT> {
             return None;
         }
         let mut name = [0u16; 64];
-        let length = GetClassNameW(hwnd, &mut name);
+        let length = GetClassNameW(fg, &mut name);
         if length <= 0 || is_shell_class(&String::from_utf16_lossy(&name[..length as usize])) {
             return None;
         }
         let mut rect = RECT::default();
-        GetWindowRect(hwnd, &mut rect).ok()?;
+        GetWindowRect(fg, &mut rect).ok()?;
         is_docked_above_taskbar(&rect, bar, m).then_some(rect)
     }
 }
