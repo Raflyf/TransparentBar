@@ -17,6 +17,7 @@ use windows::{
 
 const NAME: PCWSTR = w!("TransparentBar");
 const SUPPORT_URL: PCWSTR = w!("https://yapp.ink/raflyf");
+const SAWERIA_URL: PCWSTR = w!("https://saweria.co/BuyMatcha");
 const WINDOW_CLASS: PCWSTR = w!("TransparentBar.Window");
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 const SETTINGS_KEY: PCWSTR = w!(r"Software\TransparentBar");
@@ -41,6 +42,7 @@ const UPDATE: usize = 5;
 const PATTERN: usize = 6;
 const REDUCE_MOTION: usize = 7;
 const SUPPORT: usize = 8;
+const SAWERIA: usize = 9;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const REFRESH_TIMER_ID: usize = 1;
 const CONNECTOR_TIMER_ID: usize = 2;
@@ -540,6 +542,7 @@ fn menu(hwnd: HWND, point: POINT) -> Result<usize> {
             }
             AppendMenuW(popup, MF_STRING, ABOUT, w!("&About / license"))?;
             AppendMenuW(popup, MF_STRING, SUPPORT, w!("&Buy me a coffee"))?;
+            AppendMenuW(popup, MF_STRING, SAWERIA, w!("Support via Sa&weria"))?;
             AppendMenuW(popup, MF_STRING, EXIT, w!("E&xit"))?;
             let _ = SetForegroundWindow(hwnd);
             let selected = TrackPopupMenu(
@@ -639,6 +642,19 @@ fn schedule(hwnd: HWND, delay_ms: u32) -> Result<()> {
     }
 }
 
+unsafe fn open_url(hwnd: HWND, url: PCWSTR) -> Result<()> {
+    let mut request = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_FLAG_NO_UI,
+        hwnd,
+        lpVerb: w!("open"),
+        lpFile: url,
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    ShellExecuteExW(&mut request)
+}
+
 fn command(hwnd: HWND, id: usize) -> Result<bool> {
     match id {
         CONNECTOR => set_settings_flag(CONNECTOR_VALUE, !settings_flag(CONNECTOR_VALUE, true)?)?,
@@ -655,18 +671,8 @@ fn command(hwnd: HWND, id: usize) -> Result<bool> {
                 updater::check_in_background(hwnd, true, UPDATE_MESSAGE);
             }
         }
-        SUPPORT => unsafe {
-            let mut request = SHELLEXECUTEINFOW {
-                cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-                fMask: SEE_MASK_FLAG_NO_UI,
-                hwnd,
-                lpVerb: w!("open"),
-                lpFile: SUPPORT_URL,
-                nShow: SW_SHOWNORMAL.0,
-                ..Default::default()
-            };
-            ShellExecuteExW(&mut request)?;
-        },
+        SUPPORT => unsafe { open_url(hwnd, SUPPORT_URL)? },
+        SAWERIA => unsafe { open_url(hwnd, SAWERIA_URL)? },
         ABOUT => unsafe {
             MessageBoxW(
                 None,
@@ -676,6 +682,7 @@ Copyright 2026 Rafly Firmansyah.
 MIT License; may be redistributed under license terms. No warranty.
 Source: github.com/Raflyf/TransparentBar
 Support (optional): https://yapp.ink/raflyf
+Saweria (optional): https://saweria.co/BuyMatcha
 
 Startup settings apply to the current Windows user account only."),
                 NAME,
@@ -1356,22 +1363,34 @@ mod tests {
     #[test]
     fn support_destination_is_https_and_consistent() {
         let url = unsafe { SUPPORT_URL.to_string().unwrap() };
+        let saweria = unsafe { SAWERIA_URL.to_string().unwrap() };
         assert_eq!(url, "https://yapp.ink/raflyf");
+        assert_eq!(saweria, "https://saweria.co/BuyMatcha");
         assert_eq!(
             include_str!("../.github/FUNDING.yml").trim(),
-            format!("custom: ['{}']", url)
+            format!("custom: ['{url}', '{saweria}']")
         );
-        assert!(include_str!("../README.md").contains(&format!("[buy me a coffee]({url})")));
-        assert!(![
+        let readme = include_str!("../README.md");
+        assert!(readme.contains(&format!("[buy me a coffee]({url})")));
+        assert!(readme.contains(&format!("[Saweria]({saweria})")));
+        let commands = [
             STARTUP,
             ABOUT,
             EXIT,
             CONNECTOR,
             UPDATE,
             PATTERN,
-            REDUCE_MOTION
-        ]
-        .contains(&SUPPORT));
+            REDUCE_MOTION,
+            SUPPORT,
+            SAWERIA,
+        ];
+        for (index, id) in commands.iter().enumerate() {
+            assert!(!commands[..index].contains(id), "duplicate menu command ID");
+        }
+        assert!(
+            !command(HWND::default(), 0).unwrap(),
+            "cancel must not exit"
+        );
     }
 
     #[test]

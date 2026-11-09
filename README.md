@@ -82,6 +82,7 @@ Browse [all releases](https://github.com/Raflyf/transparentbar/releases) for ear
 | **Check for updates** / **Update available** | Check GitHub Releases for a newer version, or open the latest release page when an update is found |
 | **About / license** | View version, license information, and the support URL |
 | **Buy me a coffee** | Open the optional support page in your default browser |
+| **Support via Saweria** (next release) | Open the optional Saweria support page in your default browser |
 | **Exit** | Restore the saved appearance and exit |
 
 The tray menu uses English labels, supports keyboard navigation, and adapts to the Windows system dark or light theme. Opening the application again opens the existing instance's menu.
@@ -161,9 +162,9 @@ New features and bug fixes receive a new release version. Bug-fix releases incre
 
 ## Support
 
-If TransparentBar helps you enjoy your desktop, you can [buy me a coffee](https://yapp.ink/raflyf). Donations are optional; the app and its features remain free and open source.
+If TransparentBar helps you enjoy your desktop, you can [buy me a coffee](https://yapp.ink/raflyf) or send support through [Saweria](https://saweria.co/BuyMatcha). Donations are optional; the app and its features remain free and open source.
 
-The same link is available under **Buy me a coffee** in the tray menu, in **About / license**, and through the repository's **Sponsor** button. The app never opens it automatically or handles payments.
+The repository **Sponsor** button lists both destinations. **Buy me a coffee** is available in the published app. **Support via Saweria** and its URL in **About / license** are prepared in source for the next release alongside another feature or fix; the current v0.2.4 downloads remain unchanged. Support pages open only when selected, and the app does not handle payments.
 
 ## License
 
