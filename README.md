@@ -46,15 +46,15 @@ Your wallpaper stays visible behind pinned apps and system controls. This framed
 
 ## Resource use
 
-A user-shared Task Manager capture shows **1.6 MB of memory** for the TransparentBar host process. The annotated view below highlights the application row while keeping the surrounding context visible.
+The latest user-shared Task Manager crop shows **4.0 MB of memory** for the TransparentBar host process. The image below preserves the supplied screenshot without changing its values.
 
 | Memory | CPU | Disk | Network |
 | --- | --- | --- | --- |
-| **1.6 MB** | **0%** | **0 MB/s** | **0 Mbps** |
+| **4.0 MB** | **0%** | **0 MB/s** | Not shown in crop |
 
-![Annotated Task Manager capture highlighting TransparentBar: 1.6 MB memory, 0 percent CPU, 0 MB per second disk, and 0 Mbps network at capture time](<https://raw.githubusercontent.com/Raflyf/TransparentBar/main/assets/resource-usage-card.png>)
+![Task Manager crop showing TransparentBar: 4.0 MB memory, 0 percent CPU, and 0 MB per second disk at capture time](<https://raw.githubusercontent.com/Raflyf/TransparentBar/main/assets/resource-usage-v0.2.4.png>)
 
-These are displayed values at capture time, not a benchmark or an upper limit. CPU is rounded by Task Manager. Usage varies with Windows version and activity; the highlighted row covers the host process, not the bridge loaded inside Explorer. The frame, callout, and labels are presentation additions; the screenshot values are unchanged.
+These are displayed values at capture time, not a benchmark or an upper limit. CPU is rounded by Task Manager. Usage varies with Windows version and activity; this row covers only the host process, not the bridge loaded inside Explorer. Network usage is outside the crop.
 
 ## Download
 
