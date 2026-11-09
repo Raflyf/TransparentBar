@@ -12,6 +12,8 @@
   <a href="https://github.com/Raflyf/transparentbar/actions/workflows/build.yml"><img src="https://github.com/Raflyf/transparentbar/actions/workflows/build.yml/badge.svg" alt="Windows build status"></a>
   <a href="https://github.com/Raflyf/transparentbar/releases/latest"><img src="https://img.shields.io/github/v/release/Raflyf/transparentbar?color=285ac7" alt="Latest release"></a>
   <a href="https://github.com/Raflyf/transparentbar/blob/main/LICENSE.md"><img src="https://img.shields.io/github/license/Raflyf/transparentbar" alt="MIT license"></a>
+  <a href="https://yapp.ink/raflyf"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Yapp-FFDD00?logo=buymeacoffee&logoColor=black" alt="Buy Me a Coffee"></a>
+  <a href="https://saweria.co/BuyMatcha"><img src="https://img.shields.io/badge/Saweria-BuyMatcha-FAAE2B" alt="Support via Saweria"></a>
 </p>
 
 <p align="center">
