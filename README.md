@@ -21,7 +21,8 @@
   <a href="#getting-started">Getting started</a> ·
   <a href="#compatibility">Compatibility</a> ·
   <a href="#building-from-source">Build</a> ·
-  <a href="#contributing">Contribute</a>
+  <a href="#contributing">Contribute</a> ·
+  <a href="#support">Support</a>
 </p>
 
 TransparentBar removes the taskbar background while keeping your Windows icons and controls in place. It runs in the system tray, with optional startup at sign-in and a native menu for the settings you need.
@@ -41,7 +42,7 @@ Your wallpaper stays visible behind pinned apps and system controls. This framed
 - **Optional startup.** Enable or disable launch at sign-in from the tray menu. Off by default.
 - **Release update check.** Checks GitHub Releases for a newer version and notifies you from the system tray, with a manual check option in the tray menu.
 - **Installer or portable.** Install for your account, or extract a ZIP and run it.
-- **No accounts or telemetry.** Runs locally with no user accounts or analytics; network access is used only to check GitHub Releases for updates.
+- **No accounts or telemetry.** Runs locally with no user accounts or analytics. The app uses the network only to check GitHub Releases for updates; the optional support page opens in your browser only when you choose it.
 
 ## Resource use
 
@@ -59,8 +60,8 @@ These are displayed values at capture time, not a benchmark or an upper limit. C
 
 | Package | Best for |
 | --- | --- |
-| [Windows installer](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-setup-v0.2.3.exe) | Start Menu integration and a standard uninstall entry |
-| [Portable ZIP](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-windows-x64-v0.2.3.zip) | Running without installation |
+| [Windows installer](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-setup-v0.2.4.exe) | Start Menu integration and a standard uninstall entry |
+| [Portable ZIP](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-windows-x64-v0.2.4.zip) | Running without installation |
 
 **Requires Windows 10 or Windows 11 on an x64 PC.** No administrator access is required for normal use. ARM64 is not supported.
 
@@ -79,7 +80,8 @@ Browse [all releases](https://github.com/Raflyf/transparentbar/releases) for ear
 | **Reduce connector animation** | Disable the cross-fade so colors snap to the new edge immediately |
 | **Run at sign-in** | Toggle startup at Windows sign-in |
 | **Check for updates** / **Update available** | Check GitHub Releases for a newer version, or open the latest release page when an update is found |
-| **About / license** | View version and license information |
+| **About / license** | View version, license information, and the support URL |
+| **Buy me a coffee** | Open the optional support page in your default browser |
 | **Exit** | Restore the saved appearance and exit |
 
 The tray menu uses English labels, supports keyboard navigation, and adapts to the Windows system dark or light theme. Opening the application again opens the existing instance's menu.
@@ -156,6 +158,12 @@ The project focuses on taskbar transparency and low background overhead. Discuss
 ### Release policy
 
 New features and bug fixes receive a new release version. Bug-fix releases increment the patch version. Design-only updates, documentation, and other maintenance keep the current version; the commit SHA and CI run identify each build. Portable packages include `BUILD.txt` with the version and source commit. Each release displays its changelog directly; the source notes are maintained in [release-notes](https://github.com/Raflyf/TransparentBar/tree/main/release-notes).
+
+## Support
+
+If TransparentBar helps you enjoy your desktop, you can [buy me a coffee](https://yapp.ink/raflyf). Donations are optional; the app and its features remain free and open source.
+
+The same link is available under **Buy me a coffee** in the tray menu, in **About / license**, and through the repository's **Sponsor** button. The app never opens it automatically or handles payments.
 
 ## License
 
