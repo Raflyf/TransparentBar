@@ -54,7 +54,7 @@ The latest user-shared Task Manager crop shows **3.9 MB of memory** for the Tran
 | --- | --- | --- | --- |
 | **3.9 MB** | **0%** | **0 MB/s** | **0 Mbps** |
 
-![Task Manager crop showing TransparentBar: 3.9 MB memory, 0 percent CPU, 0 MB per second disk, and 0 Mbps network at capture time](<https://raw.githubusercontent.com/Raflyf/TransparentBar/main/assets/resource-usage-v0.2.4.png>)
+![Task Manager crop showing TransparentBar: 3.9 MB memory, 0 percent CPU, 0 MB per second disk, and 0 Mbps network at capture time](<https://raw.githubusercontent.com/Raflyf/TransparentBar/main/assets/resource-usage.png>)
 
 These are displayed values at capture time, not a benchmark or an upper limit. CPU is rounded by Task Manager. Usage varies with Windows version and activity; this row covers only the host process, not the bridge loaded inside Explorer.
 

@@ -3,3 +3,5 @@
 *.log
 /AGENTS.md
 /promo/
+%SystemDrive%/
+*.old
