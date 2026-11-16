@@ -8,7 +8,7 @@ use windows::{
     core::{s, w, Error, Result, PCWSTR},
     Win32::{
         Foundation::*,
-        Graphics::Gdi::*,
+        Graphics::{Dwm::DwmIsCompositionEnabled, Gdi::*},
         System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
         UI::{Shell::*, WindowsAndMessaging::*},
     },
@@ -567,21 +567,9 @@ pub(crate) fn fill_gradient_columns(
     }
 }
 
-/// DWM composition is resolved at runtime because it moved out of user32 on Windows 10.
+/// Check DWM composition directly via dwmapi instead of dynamic GetProcAddress lookup.
 fn dwm_composition_enabled() -> bool {
-    unsafe {
-        if let Ok(dwmapi) = GetModuleHandleW(w!("dwmapi.dll")) {
-            if let Some(address) = GetProcAddress(dwmapi, s!("DwmIsCompositionEnabled")) {
-                let is_enabled: unsafe extern "system" fn(*mut i32) -> i32 =
-                    std::mem::transmute(address);
-                let mut enabled = 0i32;
-                if is_enabled(&mut enabled) >= 0 {
-                    return enabled != 0;
-                }
-            }
-        }
-    }
-    true
+    unsafe { DwmIsCompositionEnabled().map(BOOL::as_bool).unwrap_or(true) }
 }
 
 pub(crate) fn is_shell_class(class: &str) -> bool {

@@ -15,5 +15,7 @@ foreach ($file in $Files) {
     if ($LASTEXITCODE -ne 0) { throw "Signing gagal: $file" }
     & $tool.FullName verify /pa $file
     if ($LASTEXITCODE -ne 0) { throw "Sertifikat tidak terpercaya atau signature invalid: $file" }
-    if ((Get-AuthenticodeSignature -LiteralPath $file).Status -ne 'Valid') { throw "Signature tidak valid: $file" }
+    if ([IO.Path]::GetExtension($file) -in '.exe', '.dll') {
+        if ((Get-AuthenticodeSignature -LiteralPath $file).Status -ne 'Valid') { throw "Signature tidak valid: $file" }
+    }
 }

@@ -13,14 +13,16 @@ if (-not $SkipBuild) {
 }
 $bundle = Join-Path $PSScriptRoot 'dist\TransparentBar'
 New-Item -ItemType Directory -Path $bundle -Force | Out-Null
+Get-ChildItem -LiteralPath $bundle -Filter 'transparentbar_bridge-*.dll' -File | Remove-Item
 $files = 'target\release\transparentbar.exe', 'LICENSE.md', 'README.md'
-Copy-Item -LiteralPath $files -Destination $bundle
+Copy-Item -LiteralPath $files -Destination $bundle -Force
 $commit = git rev-parse HEAD
 if ($LASTEXITCODE -ne 0) { throw 'Build must be run from a Git checkout.' }
 $version = (Select-String -LiteralPath 'Cargo.toml' -Pattern '^version = "([^"]+)"$' | Select-Object -First 1).Matches.Groups[1].Value
 @("Version: $version", "Commit: $commit") | Set-Content -LiteralPath (Join-Path $bundle 'BUILD.txt') -Encoding ascii
-Copy-Item -LiteralPath 'target\release\transparentbar_bridge.dll' -Destination (Join-Path $bundle 'transparentbar_bridge-0.2.4.dll')
-$hashes = Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $bundle 'transparentbar.exe'), (Join-Path $bundle 'transparentbar_bridge-0.2.4.dll')
+$bridgeDll = "transparentbar_bridge-$version.dll"
+Copy-Item -LiteralPath 'target\release\transparentbar_bridge.dll' -Destination (Join-Path $bundle $bridgeDll) -Force
+$hashes = Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $bundle 'transparentbar.exe'), (Join-Path $bundle $bridgeDll)
 $hashes | ForEach-Object { '{0}  {1}' -f $_.Hash.ToLowerInvariant(), (Split-Path -Leaf $_.Path) } | Set-Content -LiteralPath (Join-Path $bundle 'SHA256SUMS.txt') -Encoding ascii
 $zipName = "TransparentBar-windows-x64-v$version.zip"
 Compress-Archive -LiteralPath $bundle -DestinationPath (Join-Path $PSScriptRoot "dist\$zipName") -Force

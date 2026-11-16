@@ -10,7 +10,7 @@ use windows::{
     core::{s, w, Error, Result, PCSTR, PCWSTR},
     Win32::{
         Foundation::*,
-        System::{Com::*, LibraryLoader::*, Registry::*, Threading::*},
+        System::{Com::*, LibraryLoader::*, Registry::*, RemoteDesktop::*, Threading::*},
         UI::{Accessibility::*, Shell::*, WindowsAndMessaging::*},
     },
 };
@@ -695,27 +695,6 @@ Startup settings apply to the current Windows user account only."),
     Ok(false)
 }
 
-unsafe fn register_session_notification(hwnd: HWND) -> Option<HMODULE> {
-    if let Ok(module) = LoadLibraryW(w!("wtsapi32.dll")) {
-        if let Some(proc) = GetProcAddress(module, s!("WTSRegisterSessionNotification")) {
-            let register: unsafe extern "system" fn(HWND, u32) -> BOOL = std::mem::transmute(proc);
-            if register(hwnd, 0).as_bool() {
-                return Some(module);
-            }
-        }
-        let _ = FreeLibrary(module);
-    }
-    None
-}
-
-unsafe fn unregister_session_notification(hwnd: HWND, module: HMODULE) {
-    if let Some(proc) = GetProcAddress(module, s!("WTSUnRegisterSessionNotification")) {
-        let unregister: unsafe extern "system" fn(HWND) -> BOOL = std::mem::transmute(proc);
-        let _ = unregister(hwnd);
-    }
-    let _ = FreeLibrary(module);
-}
-
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if message == TASKBAR_CREATED.load(Ordering::Relaxed) && message != 0 {
         RESTART.store(true, Ordering::Release);
@@ -853,7 +832,8 @@ fn run() -> Result<()> {
             let mut service: Option<TaskbarService> = None;
             let mut connector = connector::Connector::create().ok();
             let mut connector_timer = None;
-            let session_module = register_session_notification(hwnd);
+            let session_registered =
+                WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION).is_ok();
             let mut paused = false;
             let result = (|| {
                 let mut connector_enabled = settings_flag(CONNECTOR_VALUE, true)?;
@@ -1117,8 +1097,8 @@ fn run() -> Result<()> {
             })();
             let _ = KillTimer(hwnd, CONNECTOR_TIMER_ID);
             let _ = KillTimer(hwnd, REFRESH_TIMER_ID);
-            if let Some(module) = session_module {
-                unregister_session_notification(hwnd, module);
+            if session_registered {
+                let _ = WTSUnRegisterSessionNotification(hwnd);
             }
             drop(connector.take());
             let restore = if let Some(service) = service.take() {

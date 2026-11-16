@@ -4,10 +4,17 @@ AppName=TransparentBar
 AppVersion=0.2.4
 VersionInfoVersion=0.2.4.0
 VersionInfoTextVersion=0.2.4
+VersionInfoCompany=Rafly Firmansyah
+VersionInfoProductName=TransparentBar
+VersionInfoProductVersion=0.2.4.0
+VersionInfoProductTextVersion=0.2.4
 VersionInfoDescription=TransparentBar Setup
+VersionInfoOriginalFileName=TransparentBar-setup-v0.2.4.exe
 VersionInfoCopyright=Copyright 2026 Rafly Firmansyah
 AppPublisher=Rafly Firmansyah
 AppPublisherURL=https://github.com/Raflyf/transparentbar
+AppSupportURL=https://github.com/Raflyf/transparentbar/issues
+AppUpdatesURL=https://github.com/Raflyf/transparentbar/releases
 DefaultDirName={localappdata}\Programs\TransparentBar
 DefaultGroupName=TransparentBar
 PrivilegesRequired=lowest
@@ -16,11 +23,17 @@ ArchitecturesInstallIn64BitMode=x64os
 MinVersion=10.0
 OutputDir=dist
 OutputBaseFilename=TransparentBar-setup-v0.2.4
-Compression=lzma2
-SolidCompression=yes
+; Avoid solid LZMA2 overlays that mimic packed malware payloads to heuristic scanners.
+Compression=none
+SolidCompression=no
 WizardStyle=modern
 SetupIconFile=assets\transparentbar.ico
 UninstallDisplayIcon={app}\transparentbar.exe
+UninstallDisplayName=TransparentBar
+#ifdef SignToolCmd
+SignTool=ci
+SignedUninstaller=yes
+#endif
 AppMutex=Local\TransparentBar.SingleInstance
 CloseApplications=no
 RestartApplications=no
