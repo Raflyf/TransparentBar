@@ -23,7 +23,8 @@
   <a href="#getting-started">Getting started</a> ·
   <a href="#compatibility">Compatibility</a> ·
   <a href="#building-from-source">Build</a> ·
-  <a href="#contributing">Contribute</a> ·
+  <a href="#code-signing-policy">Code signing policy</a> ·
+  <a href="#privacy-policy">Privacy policy</a> ·
   <a href="#support">Support</a>
 </p>
 
@@ -67,7 +68,7 @@ These are displayed values at capture time, not a benchmark or an upper limit. C
 
 **Requires Windows 10 or Windows 11 on an x64 PC.** No administrator access is required for normal use. ARM64 is not supported.
 
-Browse [all releases](https://github.com/Raflyf/transparentbar/releases) for earlier versions and release notes. Development builds are available in [GitHub Actions](https://github.com/Raflyf/transparentbar/actions).
+Browse [all releases](https://github.com/Raflyf/transparentbar/releases) for earlier versions and release notes. Development builds are available in [GitHub Actions](https://github.com/Raflyf/transparentbar/actions). See [Code signing policy](#code-signing-policy) and [Privacy policy](#privacy-policy) for release verification and network behavior details.
 
 ## Getting started
 
@@ -104,9 +105,9 @@ This is an **early release**. Windows updates can change taskbar behavior; compa
 <details>
 <summary><strong>Windows security warnings</strong></summary>
 
-Current release binaries are unsigned. Windows may show an unknown-publisher or SmartScreen warning. Download only from this repository's Releases page, and follow your organization's security policy. Do not disable antivirus or Windows protection to run the application.
+Releases published prior to SignPath CI integration (including `v0.2.4`) are unsigned. Windows may show an unknown-publisher or SmartScreen warning. Download only from this repository's Releases page, and follow your organization's security policy. Do not disable antivirus or Windows protection to run the application.
 
-The build pipeline supports Authenticode signing when the maintainer provides a trusted code-signing certificate. A self-signed certificate does not establish public trust.
+See [Code signing policy](#code-signing-policy) for planned release signing via SignPath Foundation. A self-signed certificate does not establish public trust.
 
 </details>
 
@@ -167,6 +168,26 @@ New features and bug fixes receive a new release version. Bug-fix releases incre
 If TransparentBar helps you enjoy your desktop, you can [buy me a coffee](https://yapp.ink/raflyf) or send support through [Saweria](https://saweria.co/BuyMatcha). Donations are optional; the app and its features remain free and open source.
 
 The repository **Sponsor** button lists both destinations. **Buy me a coffee** is available in the published app. **Support via Saweria** and its URL in **About / license** are prepared in source for the next release alongside another feature or fix; the current v0.2.4 downloads remain unchanged. Support pages open only when selected, and the app does not handle payments.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+Releases published prior to SignPath CI integration (including `v0.2.4`) remain unsigned until release signing is enabled in [Build Windows EXE](.github/workflows/build.yml). Signed releases are built automatically from public repository source on GitHub Actions.
+
+- **Authors / Committers:** [Rafly Firmansyah (`@Raflyf`)](https://github.com/Raflyf)
+- **Reviewers:** [Rafly Firmansyah (`@Raflyf`)](https://github.com/Raflyf) (all pull requests require maintainer review before merge)
+- **Approvers:** [Rafly Firmansyah (`@Raflyf`)](https://github.com/Raflyf) (reviews release tags and approves signing requests)
+- **Privacy policy:** See [Privacy policy](#privacy-policy).
+
+## Privacy policy
+
+TransparentBar does not collect, store, or transmit personal information, telemetry, analytics, screen captures, or user preferences to developer servers or third parties.
+
+- **Local settings and diagnostics:** Tray preferences (`TaskbarConnector`, `TaskbarPattern`, `ReduceMotion`) are stored locally under `HKCU\Software\TransparentBar`, and optional startup at sign-in writes only to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Startup diagnostics are saved locally to `%LOCALAPPDATA%\TransparentBar\startup.log`.
+- **Maximized-window connector:** Screen edge samples are processed solely in memory to match the connector gradient and are never saved to disk or transmitted over the network.
+- **Update check:** On startup and when triggered manually from **Check for updates**, TransparentBar sends read-only HTTPS requests (`HEAD https://github.com/Raflyf/TransparentBar/releases/latest` with redirects disabled, falling back to `GET https://api.github.com/repos/Raflyf/TransparentBar/releases/latest`) with `User-Agent: TransparentBar` to compare release tags. No personal identifiers, local paths, or screen data are sent, and release pages open in your browser only when you choose to open them.
+- **External links:** Selecting **Buy me a coffee**, **Support via Saweria**, or repository links opens external websites in your default browser under their own privacy policies.
 
 ## License
 
