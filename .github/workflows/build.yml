@@ -57,35 +57,37 @@ jobs:
         run: ./sign.ps1 -Files target/release/transparentbar.exe,target/release/transparentbar_bridge.dll
       - name: Package portable application
         run: ./build.ps1 -SkipBuild
-      - name: Build setup installer
-        env:
-          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      - name: Setup .NET SDK for WiX
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.x'
+      - name: Build setup installer (MSI)
         run: |
-          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path -LiteralPath $compiler)) {
-            choco install innosetup --yes --no-progress
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          $isccArgs = @('setup.iss')
-          if ($env:WINDOWS_CERTIFICATE_BASE64) {
-            $isccArgs = @('/DSignToolCmd', '/Sci=pwsh -NoProfile -ExecutionPolicy Bypass -File sign.ps1 -Files $f', 'setup.iss')
-          }
-          & $compiler @isccArgs
+          dotnet tool update --global wix --version 5.0.2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tools = Join-Path $env:USERPROFILE '.dotnet\tools'
+          $env:PATH = "$tools;$env:PATH"
+          wix extension add --global WixToolset.UI.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          wix extension add --global WixToolset.Util.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = (Select-String -LiteralPath 'Cargo.toml' -Pattern '^version = "([^"]+)"$' | Select-Object -First 1).Matches.Groups[1].Value
+          $msiOut = "dist\TransparentBar-setup-v$version.msi"
+          wix build setup.wxs -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -d "Version=$version" -out $msiOut
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Sign setup when certificate exists
         env:
           WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
-          $setupExe = (Get-ChildItem dist/*setup*.exe | Select-Object -First 1).FullName
-          ./sign.ps1 -Files $setupExe
+          $setupMsi = (Get-ChildItem dist/*setup*.msi | Select-Object -First 1).FullName
+          ./sign.ps1 -Files $setupMsi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: TransparentBar-windows-x64
           path: |
             dist/*.zip
-            dist/*.exe
+            dist/*.msi
           if-no-files-found: error
           retention-days: 30
 
@@ -108,4 +110,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" dist/*.zip dist/*.exe --title "TransparentBar $RELEASE_TAG" --verify-tag --notes-file "release-notes/$RELEASE_TAG.md"
+        run: gh release create "$RELEASE_TAG" dist/*.zip dist/*.msi --title "TransparentBar $RELEASE_TAG" --verify-tag --notes-file "release-notes/$RELEASE_TAG.md"
