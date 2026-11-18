@@ -72,8 +72,14 @@ jobs:
           wix extension add --global WixToolset.Util.wixext/5.0.2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $version = (Select-String -LiteralPath 'Cargo.toml' -Pattern '^version = "([^"]+)"$' | Select-Object -First 1).Matches.Groups[1].Value
+          $hash = [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes("transparentbar_bridge-$version.dll"))
+          $bytes = [byte[]]::new(16)
+          [Array]::Copy($hash, $bytes, 16)
+          $bytes[6] = ($bytes[6] -band 0x0F) -bor 0x40
+          $bytes[8] = ($bytes[8] -band 0x3F) -bor 0x80
+          $bridgeGuid = ([guid]::new($bytes)).ToString().ToUpperInvariant()
           $msiOut = "dist\TransparentBar-setup-v$version.msi"
-          wix build setup.wxs -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -d "Version=$version" -out $msiOut
+          wix build setup.wxs -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -d "Version=$version" -d "BridgeGuid=$bridgeGuid" -out $msiOut
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Sign setup when certificate exists
         env:

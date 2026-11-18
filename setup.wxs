@@ -63,7 +63,7 @@
              Description="TransparentBar application, taskbar bridge DLL, and Start Menu shortcut."
              ConfigurableDirectory="INSTALLFOLDER"
              Level="1"
-             Absent="disallow">
+             AllowAbsent="no">
       <ComponentRef Id="AppExeComponent" />
       <ComponentRef Id="BridgeDllComponent" />
       <ComponentRef Id="LicenseComponent" />
@@ -89,25 +89,25 @@
 
   <Fragment>
     <ComponentGroup Id="ApplicationComponents">
-      <Component Id="AppExeComponent" Directory="INSTALLFOLDER" Guid="*">
+      <Component Id="AppExeComponent" Directory="INSTALLFOLDER" Guid="C751F4BC-A4A3-4E9F-A82E-DC7940ACABB8">
         <RegistryValue Root="HKCU" Key="Software\TransparentBar\Installer" Name="AppExe" Type="string" Value="1" KeyPath="yes" />
         <File Id="TransparentBarExe" Source="dist\TransparentBar\transparentbar.exe" />
         <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
         <RemoveFolder Id="RemoveLocalProgramsFolder" Directory="LocalProgramsFolder" On="uninstall" />
       </Component>
-      <Component Id="BridgeDllComponent" Directory="INSTALLFOLDER" Guid="*">
+      <Component Id="BridgeDllComponent" Directory="INSTALLFOLDER" Guid="$(var.BridgeGuid)">
         <RegistryValue Root="HKCU" Key="Software\TransparentBar\Installer" Name="BridgeDll" Type="string" Value="$(var.Version)" KeyPath="yes" />
         <File Id="BridgeDll" Source="dist\TransparentBar\transparentbar_bridge-$(var.Version).dll" />
       </Component>
-      <Component Id="LicenseComponent" Directory="INSTALLFOLDER" Guid="*">
+      <Component Id="LicenseComponent" Directory="INSTALLFOLDER" Guid="2794230B-9082-4BC7-83A9-A5008FC504A6">
         <RegistryValue Root="HKCU" Key="Software\TransparentBar\Installer" Name="License" Type="string" Value="1" KeyPath="yes" />
         <File Id="LicenseFile" Source="LICENSE.md" />
       </Component>
-      <Component Id="ReadmeComponent" Directory="INSTALLFOLDER" Guid="*">
+      <Component Id="ReadmeComponent" Directory="INSTALLFOLDER" Guid="5C47F12C-1898-4FA1-A282-B349A99DEAE2">
         <RegistryValue Root="HKCU" Key="Software\TransparentBar\Installer" Name="Readme" Type="string" Value="1" KeyPath="yes" />
         <File Id="ReadmeFile" Source="README.md" />
       </Component>
-      <Component Id="BuildTxtComponent" Directory="INSTALLFOLDER" Guid="*">
+      <Component Id="BuildTxtComponent" Directory="INSTALLFOLDER" Guid="D0754AD1-9597-4937-A9A8-39624B579451">
         <RegistryValue Root="HKCU" Key="Software\TransparentBar\Installer" Name="BuildTxt" Type="string" Value="1" KeyPath="yes" />
         <File Id="BuildFile" Source="dist\TransparentBar\BUILD.txt" />
       </Component>
