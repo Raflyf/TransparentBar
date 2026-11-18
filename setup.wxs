@@ -22,12 +22,13 @@
     <Property Id="ARPURLUPDATEINFO" Value="https://github.com/Raflyf/TransparentBar/releases" />
     <!-- Keep Explorer running even when an older versioned bridge DLL is still loaded in shell memory. -->
     <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+    <Property Id="MSIFASTINSTALL" Value="7" />
     <Property Id="REBOOT" Value="ReallySuppress" />
 
     <util:CloseApplication Id="CloseTransparentBar"
                            Target="transparentbar.exe"
                            CloseMessage="yes"
-                           Timeout="5"
+                           Timeout="2"
                            RebootPrompt="no" />
 
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
@@ -38,8 +39,9 @@
                   DllEntry="WixShellExec"
                   Impersonate="yes" />
 
+    <UIRef Id="WixUI_ErrorProgressText" />
     <UI>
-      <ui:WixUI Id="WixUI_FeatureTree" />
+      <ui:WixUI Id="WixUI_Minimal" />
       <Publish Dialog="ExitDialog"
                Control="Finish"
                Event="DoAction"
@@ -47,6 +49,8 @@
                Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
     </UI>
     <WixVariable Id="WixUILicenseRtf" Value="assets\license.rtf" />
+    <WixVariable Id="WixUIBannerBmp" Value="assets\wix-banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="assets\wix-dialog.bmp" />
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="LocalProgramsFolder" Name="Programs">
@@ -56,12 +60,10 @@
     <StandardDirectory Id="ProgramMenuFolder">
       <Directory Id="ApplicationProgramsFolder" Name="TransparentBar" />
     </StandardDirectory>
-    <StandardDirectory Id="DesktopFolder" />
 
     <Feature Id="MainFeature"
              Title="TransparentBar"
              Description="TransparentBar application, taskbar bridge DLL, and Start Menu shortcut."
-             ConfigurableDirectory="INSTALLFOLDER"
              Level="1"
              AllowAbsent="no">
       <ComponentRef Id="AppExeComponent" />
@@ -70,20 +72,6 @@
       <ComponentRef Id="ReadmeComponent" />
       <ComponentRef Id="BuildTxtComponent" />
       <ComponentRef Id="StartMenuShortcutComponent" />
-
-      <Feature Id="DesktopShortcutFeature"
-               Title="Create a desktop shortcut"
-               Description="Add a TransparentBar shortcut to the desktop."
-               Level="2">
-        <ComponentRef Id="DesktopShortcutComponent" />
-      </Feature>
-
-      <Feature Id="StartupFeature"
-               Title="Run at Windows sign-in"
-               Description="Automatically start TransparentBar when you sign in to Windows."
-               Level="2">
-        <ComponentRef Id="StartupComponent" />
-      </Feature>
     </Feature>
   </Package>
 
@@ -120,23 +108,6 @@
                   Icon="TransparentBar.exe"
                   Advertise="no" />
         <RemoveFolder Id="RemoveApplicationProgramsFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
-      </Component>
-      <Component Id="DesktopShortcutComponent" Directory="DesktopFolder" Guid="*">
-        <RegistryValue Root="HKCU" Key="Software\TransparentBar\Installer" Name="DesktopShortcut" Type="string" Value="1" KeyPath="yes" />
-        <Shortcut Id="DesktopShortcut"
-                  Name="TransparentBar"
-                  Target="[INSTALLFOLDER]transparentbar.exe"
-                  WorkingDirectory="INSTALLFOLDER"
-                  Icon="TransparentBar.exe"
-                  Advertise="no" />
-      </Component>
-      <Component Id="StartupComponent" Directory="INSTALLFOLDER" Guid="*">
-        <RegistryValue Root="HKCU"
-                       Key="Software\Microsoft\Windows\CurrentVersion\Run"
-                       Name="TransparentBar"
-                       Type="string"
-                       Value="&quot;[INSTALLFOLDER]transparentbar.exe&quot;"
-                       KeyPath="yes" />
       </Component>
     </ComponentGroup>
   </Fragment>
