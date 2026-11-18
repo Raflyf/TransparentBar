@@ -63,8 +63,8 @@ These are displayed values at capture time, not a benchmark or an upper limit. C
 
 | Package | Best for |
 | --- | --- |
-| [Windows installer](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-setup-v0.2.4.exe) | Start Menu integration and a standard uninstall entry |
-| [Portable ZIP](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-windows-x64-v0.2.4.zip) | Running without installation |
+| [Windows installer](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-setup-v0.2.5.msi) | Start Menu integration and a standard uninstall entry |
+| [Portable ZIP](https://github.com/Raflyf/transparentbar/releases/latest/download/TransparentBar-windows-x64-v0.2.5.zip) | Running without installation |
 
 **Requires Windows 10 or Windows 11 on an x64 PC.** No administrator access is required for normal use. ARM64 is not supported.
 
@@ -167,7 +167,7 @@ New features and bug fixes receive a new release version. Bug-fix releases incre
 
 If TransparentBar helps you enjoy your desktop, you can [buy me a coffee](https://yapp.ink/raflyf) or send support through [Saweria](https://saweria.co/BuyMatcha). Donations are optional; the app and its features remain free and open source.
 
-The repository **Sponsor** button lists both destinations. **Buy me a coffee** is available in the published app. **Support via Saweria** and its URL in **About / license** are prepared in source for the next release alongside another feature or fix; the current v0.2.4 downloads remain unchanged. Support pages open only when selected, and the app does not handle payments.
+The repository **Sponsor** button lists both destinations. **Buy me a coffee** and **Support via Saweria** are available in the published app. Support pages open only when selected, and the app does not handle payments.
 
 ## Code signing policy
 

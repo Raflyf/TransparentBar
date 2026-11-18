@@ -676,7 +676,7 @@ fn command(hwnd: HWND, id: usize) -> Result<bool> {
         ABOUT => unsafe {
             MessageBoxW(
                 None,
-                w!("TransparentBar 0.2.4
+                w!("TransparentBar 0.2.5
 Native Rust, Windows 10 and 11 x64.
 Copyright 2026 Rafly Firmansyah.
 MIT License; may be redistributed under license terms. No warranty.
@@ -770,6 +770,32 @@ unsafe extern "system" fn foreground_changed(
     }
 }
 
+fn cleanup_stale_bridges_in(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let is_bridge_artifact = name.starts_with("transparentbar_bridge-")
+            && (name.ends_with(".dll") || name.ends_with(".dll.old"));
+        if is_bridge_artifact && !name.eq_ignore_ascii_case(BRIDGE_FILE) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn cleanup_stale_bridges() {
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    {
+        cleanup_stale_bridges_in(&dir);
+    }
+}
+
 fn run() -> Result<()> {
     unsafe {
         let mutex = CreateMutexW(None, false, w!(r"Local\TransparentBar.SingleInstance"))?;
@@ -781,6 +807,7 @@ fn run() -> Result<()> {
                 }
                 return Ok(());
             }
+            cleanup_stale_bridges();
             let application_icon = icon::AppIcon::load()?;
             let instance = HINSTANCE(GetModuleHandleW(None)?.0);
             let class = WNDCLASSW {
@@ -1479,5 +1506,28 @@ mod tests {
         assert!(updater::is_newer("v0.2.0", "0.1.5"));
         assert!(!updater::is_newer("v0.1.5", "0.1.5"));
         assert!(!updater::is_newer("v0.1.4", "0.1.5"));
+    }
+
+    #[test]
+    fn stale_bridge_cleanup_removes_only_older_bridge_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "transparentbar-bridge-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let current = root.join(BRIDGE_FILE);
+        let old_dll = root.join("transparentbar_bridge-0.2.4.dll");
+        let old_bak = root.join("transparentbar_bridge-0.2.4.dll.old");
+        let unrelated = root.join("README.md");
+        for file in [&current, &old_dll, &old_bak, &unrelated] {
+            std::fs::write(file, b"x").unwrap();
+        }
+        cleanup_stale_bridges_in(&root);
+        assert!(current.exists());
+        assert!(!old_dll.exists());
+        assert!(!old_bak.exists());
+        assert!(unrelated.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

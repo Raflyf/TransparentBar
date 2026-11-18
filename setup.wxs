@@ -11,6 +11,7 @@
     <Launch Condition="Installed OR (VersionNT64 &gt;= 603)"
             Message="TransparentBar requires 64-bit Windows 10 or Windows 11." />
     <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed."
+                  AllowSameVersionUpgrades="yes"
                   Schedule="afterInstallExecute" />
     <!-- Store payloads uncompressed in the embedded CAB to avoid high-entropy packer heuristics. -->
     <MediaTemplate EmbedCab="yes" CompressionLevel="none" />
@@ -83,7 +84,8 @@
         <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
         <RemoveFolder Id="RemoveLocalProgramsFolder" Directory="LocalProgramsFolder" On="uninstall" />
       </Component>
-      <Component Id="BridgeDllComponent" Directory="INSTALLFOLDER" Guid="$(var.BridgeGuid)">
+      <!-- Keep prior versioned bridge DLLs intact during upgrade uninstall so Explorer handles never trigger RemoveFiles conflicts; transparentbar.exe sweeps unlocked older DLLs on startup. -->
+      <Component Id="BridgeDllComponent" Directory="INSTALLFOLDER" Guid="$(var.BridgeGuid)" Permanent="yes">
         <RegistryValue Root="HKCU" Key="Software\TransparentBar\Installer" Name="BridgeDll" Type="string" Value="$(var.Version)" KeyPath="yes" />
         <File Id="BridgeDll" Source="dist\TransparentBar\transparentbar_bridge-$(var.Version).dll" />
       </Component>
