@@ -1,13 +1,114 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none" role="img" aria-labelledby="title desc">
   <title id="title">TransparentBar</title>
-  <desc id="desc">A taskbar becoming transparent, with three app tiles over a visible alpha grid.</desc>
-  <defs><clipPath id="bar"><rect x="3" y="14" width="42" height="21" rx="3"/></clipPath></defs>
-  <path fill="#DFE7F2" d="M28 7h16v32H28z"/>
-  <path fill="#A6BCD9" d="M36 7h8v8h-8zM28 15h8v8h-8zM36 23h8v8h-8zM28 31h8v8h-8z"/>
-  <path fill="#285AC7" clip-path="url(#bar)" d="M0 14h32l-8 21H0z"/>
-  <rect x="3" y="14" width="42" height="21" rx="3" stroke="#1C2C43" stroke-width="1.4"/>
-  <rect x="8" y="21" width="6" height="6" rx="1" fill="#FFFFFF"/>
-  <rect x="20" y="21" width="6" height="6" rx="1" fill="#FFFFFF"/>
-  <rect x="34" y="21" width="6" height="6" rx="1" fill="#1C2C43"/>
-  <rect x="20.5" y="30.5" width="5" height="1.5" rx="0.75" fill="#FFFFFF"/>
+  <desc id="desc">Tilted copper-rimmed taskbar transitioning diagonally from dark graphite to transparent glass over a warm sunset backdrop.</desc>
+  <defs>
+    <filter id="castShadow" x="-30%" y="-60%" width="160%" height="260%">
+      <feGaussianBlur stdDeviation="15"/>
+    </filter>
+    <filter id="dockShadow" x="-20%" y="-25%" width="140%" height="165%">
+      <feDropShadow dx="0" dy="14" stdDeviation="12" flood-color="#111111" flood-opacity="0.56"/>
+    </filter>
+    <linearGradient id="copperBevel" x1="50" y1="150" x2="430" y2="380" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#AE7D57"/>
+      <stop offset="0.5" stop-color="#63321F"/>
+      <stop offset="1" stop-color="#291813"/>
+    </linearGradient>
+    <linearGradient id="frameBody" x1="40" y1="148" x2="460" y2="365" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3E3631"/>
+      <stop offset="0.35" stop-color="#221E1B"/>
+      <stop offset="1" stop-color="#111111"/>
+    </linearGradient>
+    <linearGradient id="rimHighlight" x1="36" y1="152" x2="476" y2="360" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#DCC0A1" stop-opacity="0.96"/>
+      <stop offset="0.48" stop-color="#AE7D57" stop-opacity="0.48"/>
+      <stop offset="1" stop-color="#D9541E" stop-opacity="0.92"/>
+    </linearGradient>
+    <linearGradient id="opaqueSide" x1="48" y1="168" x2="326" y2="346" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#211B18"/>
+      <stop offset="0.52" stop-color="#793827"/>
+      <stop offset="1" stop-color="#D9541E"/>
+    </linearGradient>
+    <linearGradient id="backdropSky" x1="276" y1="74" x2="444" y2="428" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#281F1B"/>
+      <stop offset="0.34" stop-color="#8C4D2D"/>
+      <stop offset="0.72" stop-color="#D9541E"/>
+      <stop offset="1" stop-color="#F6B570"/>
+    </linearGradient>
+    <linearGradient id="silkWave" x1="256" y1="204" x2="452" y2="336" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFF1D1"/>
+      <stop offset="0.58" stop-color="#F6B570"/>
+      <stop offset="1" stop-color="#D9541E" stop-opacity="0.72"/>
+    </linearGradient>
+    <linearGradient id="glassPane" x1="256" y1="158" x2="466" y2="354" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFF1D1" stop-opacity="0.32"/>
+      <stop offset="0.48" stop-color="#F3EEE3" stop-opacity="0.1"/>
+      <stop offset="1" stop-color="#F6B570" stop-opacity="0.22"/>
+    </linearGradient>
+    <linearGradient id="orangeTile" x1="218" y1="204" x2="294" y2="280" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F6B570"/>
+      <stop offset="0.36" stop-color="#D9541E"/>
+      <stop offset="1" stop-color="#9A3612"/>
+    </linearGradient>
+    <clipPath id="stripClip">
+      <rect x="274" y="70" width="174" height="362" rx="32"/>
+    </clipPath>
+    <clipPath id="barClip">
+      <rect x="36" y="160" width="440" height="192" rx="36"/>
+    </clipPath>
+  </defs>
+
+  <ellipse cx="262" cy="450" rx="170" ry="22" fill="#111111" opacity="0.38" filter="url(#castShadow)"/>
+
+  <g transform="rotate(-10 256 256)">
+    <!-- Back transparent sunset strip card -->
+    <rect x="278" y="76" width="176" height="364" rx="34" fill="#291813"/>
+    <g clip-path="url(#stripClip)">
+      <rect x="274" y="70" width="174" height="362" fill="url(#backdropSky)"/>
+      <circle cx="388" cy="142" r="30" fill="#FFEDC8"/>
+      <!-- Warm sand checkerboard visible beneath glass half -->
+      <g opacity="0.26">
+        <rect x="274" y="70" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="362" y="70" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="318" y="115" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="406" y="115" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="274" y="160" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="362" y="160" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="318" y="205" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="406" y="205" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="274" y="250" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="362" y="250" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="318" y="295" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="406" y="295" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="274" y="340" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="362" y="340" width="44" height="45" fill="#F3EEE3"/>
+        <rect x="318" y="385" width="44" height="47" fill="#F3EEE3"/>
+        <rect x="406" y="385" width="44" height="47" fill="#F3EEE3"/>
+      </g>
+      <path d="M254 246 C310 210, 366 292, 464 240 L464 298 C366 346, 310 272, 254 300 Z" fill="url(#silkWave)"/>
+      <path d="M254 250 C312 216, 366 294, 464 246" stroke="#FFF1D1" stroke-opacity="0.75" stroke-width="3"/>
+    </g>
+    <rect x="274" y="70" width="174" height="362" rx="32" stroke="#AE7D57" stroke-opacity="0.72" stroke-width="4"/>
+
+    <!-- Sculpted copper-bezel dock -->
+    <g filter="url(#dockShadow)">
+      <rect x="30" y="158" width="454" height="206" rx="41" fill="url(#copperBevel)"/>
+      <rect x="26" y="150" width="456" height="204" rx="40" fill="url(#frameBody)" stroke="url(#rimHighlight)" stroke-width="3.5"/>
+    </g>
+
+    <g clip-path="url(#barClip)">
+      <rect x="36" y="160" width="440" height="192" fill="url(#glassPane)"/>
+      <!-- Diagonal cut placed cleanly between center & right tile -->
+      <path d="M28 154 H348 L286 358 H28 Z" fill="url(#opaqueSide)"/>
+      <path d="M346 156 L284 356" stroke="#FFEDC8" stroke-opacity="0.62" stroke-width="3.5"/>
+      <path d="M36 160 H476 L36 254 Z" fill="#F3EEE3" fill-opacity="0.06"/>
+    </g>
+    <rect x="36" y="160" width="440" height="192" rx="36" stroke="#DCC0A1" stroke-opacity="0.38" stroke-width="2"/>
+    <path d="M68 152 H442" stroke="#F3EEE3" stroke-opacity="0.74" stroke-width="2.5" stroke-linecap="round"/>
+
+    <!-- Three clean, high-contrast tiles -->
+    <rect x="86" y="208" width="80" height="80" rx="17" fill="#F3EEE3"/>
+    <rect x="216" y="204" width="80" height="80" rx="17" fill="url(#orangeTile)" stroke="#FFEDC8" stroke-opacity="0.82" stroke-width="2"/>
+    <rect x="232" y="306" width="48" height="12" rx="6" fill="#FFEDC8"/>
+    <rect x="346" y="208" width="80" height="80" rx="17" fill="#151312" stroke="#DCC0A1" stroke-opacity="0.86" stroke-width="3"/>
+  </g>
 </svg>
