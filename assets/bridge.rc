@@ -1,6 +1,6 @@
 1 VERSIONINFO
-FILEVERSION 0,2,5,0
-PRODUCTVERSION 0,2,5,0
+FILEVERSION 0,2,6,0
+PRODUCTVERSION 0,2,6,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0
 FILEOS 0x40004L
@@ -12,11 +12,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Rafly Firmansyah\0"
       VALUE "FileDescription", "TransparentBar Taskbar Bridge\0"
-      VALUE "FileVersion", "0.2.5\0"
+      VALUE "FileVersion", "0.2.6\0"
       VALUE "InternalName", "transparentbar_bridge\0"
-      VALUE "OriginalFilename", "transparentbar_bridge-0.2.5.dll\0"
+      VALUE "OriginalFilename", "transparentbar_bridge-0.2.6.dll\0"
       VALUE "ProductName", "TransparentBar\0"
-      VALUE "ProductVersion", "0.2.5\0"
+      VALUE "ProductVersion", "0.2.6\0"
     END
   END
   BLOCK "VarFileInfo"
