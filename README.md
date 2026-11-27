@@ -150,7 +150,7 @@ cargo build --release --locked
 .\build.ps1 -SkipBuild
 ```
 
-The portable package is created in `dist\TransparentBar-windows-x64-v<version>.zip`. To build the MSI installer locally, install WiX v5 (`dotnet tool install --global wix --version 5.0.2` plus the UI and Util extensions) and compile [setup.wxs](https://github.com/Raflyf/transparentbar/blob/main/setup.wxs) (a legacy Inno Setup script is also kept in [setup.iss](https://github.com/Raflyf/transparentbar/blob/main/setup.iss)). GitHub Actions builds both release packages; version tags publish them to Releases.
+The portable package is created in `dist\TransparentBar-windows-x64-v<version>.zip`. To build the MSI installer locally, install WiX v5 (`dotnet tool install --global wix --version 5.0.2` plus the UI and Util extensions) and compile [setup.wxs](https://github.com/Raflyf/transparentbar/blob/main/setup.wxs). GitHub Actions builds both release packages; version tags publish them to Releases.
 
 GNU toolchain builds are available for development, but the release pipeline uses MSVC to embed Windows executable resources.
 
