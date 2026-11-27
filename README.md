@@ -49,13 +49,13 @@ Your wallpaper stays visible behind pinned apps and system controls. This framed
 
 ## Resource use
 
-The latest user-shared Task Manager crop shows **3.9 MB of memory** for the TransparentBar host process. The image below preserves the supplied screenshot without changing its values.
+The latest user-shared Task Manager crop on `v0.2.7` shows **0.2 MB of memory** for the TransparentBar host process. The image below preserves the supplied screenshot without changing its values.
 
 | Memory | CPU | Disk | Network |
 | --- | --- | --- | --- |
-| **3.9 MB** | **0%** | **0 MB/s** | **0 Mbps** |
+| **0.2 MB** | **0%** | **0 MB/s** | **0 Mbps** |
 
-![Task Manager crop showing TransparentBar: 3.9 MB memory, 0 percent CPU, 0 MB per second disk, and 0 Mbps network at capture time](<https://raw.githubusercontent.com/Raflyf/TransparentBar/main/assets/resource-usage.png>)
+![Task Manager crop showing TransparentBar: 0.2 MB memory, 0 percent CPU, 0 MB per second disk, and 0 Mbps network at capture time](<https://raw.githubusercontent.com/Raflyf/TransparentBar/main/assets/resource-usage.png>)
 
 These are displayed values at capture time, not a benchmark or an upper limit. CPU is rounded by Task Manager. Usage varies with Windows version and activity; this row covers only the host process, not the bridge loaded inside Explorer.
 
@@ -82,6 +82,7 @@ Browse [all releases](https://github.com/Raflyf/transparentbar/releases) for ear
 | **Connector pattern** | Toggle the faint grid pattern on the strip |
 | **Reduce connector animation** | Disable the cross-fade so colors snap to the new edge immediately |
 | **Run at sign-in** | Toggle startup at Windows sign-in |
+| **Check updates at launch** | Toggle the automatic startup check against GitHub Releases |
 | **Check for updates** / **Update available** | Check GitHub Releases for a newer version, or open the latest release page when an update is found |
 | **About / license** | View version, license information, and the support URL |
 | **Buy me a coffee** | Open the optional support page in your default browser |
@@ -149,7 +150,7 @@ cargo build --release --locked
 .\build.ps1 -SkipBuild
 ```
 
-The portable package is created in `dist\TransparentBar-windows-x64-v<version>.zip`. To build the installer, install Inno Setup and compile [setup.iss](https://github.com/Raflyf/transparentbar/blob/main/setup.iss). GitHub Actions builds both packages; version tags publish them to Releases.
+The portable package is created in `dist\TransparentBar-windows-x64-v<version>.zip`. To build the MSI installer locally, install WiX v5 (`dotnet tool install --global wix --version 5.0.2` plus the UI and Util extensions) and compile [setup.wxs](https://github.com/Raflyf/transparentbar/blob/main/setup.wxs) (a legacy Inno Setup script is also kept in [setup.iss](https://github.com/Raflyf/transparentbar/blob/main/setup.iss)). GitHub Actions builds both release packages; version tags publish them to Releases.
 
 GNU toolchain builds are available for development, but the release pipeline uses MSVC to embed Windows executable resources.
 
