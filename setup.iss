@@ -1,15 +1,15 @@
 [Setup]
 AppId={{C38347CB-7CD0-4D9F-BEE5-05204A3B269F}
 AppName=TransparentBar
-AppVersion=0.2.6
-VersionInfoVersion=0.2.6.0
-VersionInfoTextVersion=0.2.6
+AppVersion=0.2.7
+VersionInfoVersion=0.2.7.0
+VersionInfoTextVersion=0.2.7
 VersionInfoCompany=Rafly Firmansyah
 VersionInfoProductName=TransparentBar
-VersionInfoProductVersion=0.2.6.0
-VersionInfoProductTextVersion=0.2.6
+VersionInfoProductVersion=0.2.7.0
+VersionInfoProductTextVersion=0.2.7
 VersionInfoDescription=TransparentBar Setup
-VersionInfoOriginalFileName=TransparentBar-setup-v0.2.6.exe
+VersionInfoOriginalFileName=TransparentBar-setup-v0.2.7.exe
 VersionInfoCopyright=Copyright 2026 Rafly Firmansyah
 AppPublisher=Rafly Firmansyah
 AppPublisherURL=https://github.com/Raflyf/transparentbar
@@ -22,7 +22,7 @@ ArchitecturesAllowed=x64os
 ArchitecturesInstallIn64BitMode=x64os
 MinVersion=10.0
 OutputDir=dist
-OutputBaseFilename=TransparentBar-setup-v0.2.6
+OutputBaseFilename=TransparentBar-setup-v0.2.7
 ; Avoid solid LZMA2 overlays that mimic packed malware payloads to heuristic scanners.
 Compression=none
 SolidCompression=no
@@ -41,7 +41,7 @@ LicenseFile=LICENSE.md
 
 [Files]
 Source: "dist\TransparentBar\transparentbar.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\TransparentBar\transparentbar_bridge-0.2.6.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\TransparentBar\transparentbar_bridge-0.2.7.dll"; DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
 Source: "LICENSE.md"; DestDir: "{app}"
 Source: "README.md"; DestDir: "{app}"
 Source: "dist\TransparentBar\BUILD.txt"; DestDir: "{app}"; Flags: ignoreversion
@@ -92,7 +92,7 @@ begin
   if CurStep = ssInstall then
   begin
     AppDir := ExpandConstant('{app}');
-    BridgeDll := AppDir + '\transparentbar_bridge-0.2.6.dll';
+    BridgeDll := AppDir + '\transparentbar_bridge-0.2.7.dll';
     OldDll := BridgeDll + '.old';
     if FileExists(BridgeDll) then
     begin

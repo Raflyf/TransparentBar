@@ -2,7 +2,10 @@
 
 use std::{
     mem::size_of,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        OnceLock,
+    },
 };
 use windows::{
     core::{s, w, Error, Result, PCWSTR},
@@ -18,8 +21,6 @@ const CLASS: PCWSTR = w!("TransparentBar.Connector");
 // Base sizes are device pixels at 96 DPI; Metrics scales them per monitor.
 const BASE_SEAM_OVERLAP: i32 = 2;
 const BASE_SAMPLE_ROWS: i32 = 4;
-/// Fraction of the remaining colour gap closed per frame, which produces the fade.
-const BLEND_STEP: f32 = 0.5;
 const BASE_BLUR_RADIUS: i32 = 8;
 const BASE_STRIP_HEIGHT: i32 = 34;
 const BASE_FRAME_OVERHANG: i32 = 14;
@@ -33,6 +34,11 @@ const GRID_ALPHA: f32 = 0.07;
 const MAX_STRIP_FRACTION: i32 = 55;
 const MAX_STRIP_FRACTION_DEN: i32 = 100;
 const MAX_STRIP_WIDTH: i32 = 1920;
+const SETTLED_THRESHOLD: u32 = 20;
+const QUIESCENT_THRESHOLD: u32 = 60;
+
+type GetDpiForWindowFn = unsafe extern "system" fn(HWND) -> u32;
+static GET_DPI_FOR_WINDOW: OnceLock<Option<GetDpiForWindowFn>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Style {
@@ -66,16 +72,25 @@ pub(crate) fn metrics(dpi: u32) -> Metrics {
     }
 }
 
-/// Monitor DPI of a window; GetDpiForWindow needs Windows 10 1607, so it is resolved at runtime.
+/// Monitor DPI of a window; GetDpiForWindow needs Windows 10 1607, resolved once and cached.
 fn dpi_for_window(hwnd: HWND) -> u32 {
+    let get_dpi = *GET_DPI_FOR_WINDOW.get_or_init(|| {
+        // SAFETY: user32.dll stays loaded for the process lifetime; GetDpiForWindow matches GetDpiForWindowFn ABI.
+        unsafe {
+            let user32 = GetModuleHandleW(w!("user32.dll")).ok()?;
+            let address = GetProcAddress(user32, s!("GetDpiForWindow"))?;
+            Some(std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                GetDpiForWindowFn,
+            >(address))
+        }
+    });
+    // SAFETY: cached user32 function pointer and fallback screen DC query are thread-safe Win32 calls.
     unsafe {
-        if let Ok(user32) = GetModuleHandleW(w!("user32.dll")) {
-            if let Some(address) = GetProcAddress(user32, s!("GetDpiForWindow")) {
-                let get: unsafe extern "system" fn(HWND) -> u32 = std::mem::transmute(address);
-                let dpi = get(hwnd);
-                if dpi != 0 {
-                    return dpi;
-                }
+        if let Some(get) = get_dpi {
+            let dpi = get(hwnd);
+            if dpi != 0 {
+                return dpi;
             }
         }
         let screen = GetDC(None);
@@ -157,7 +172,7 @@ impl Dib {
         {
             *slot = Some(Self::new(width, height)?);
         }
-        Ok(slot.as_mut().unwrap())
+        slot.as_mut().ok_or_else(|| Error::from(E_FAIL))
     }
 
     fn pixels(&mut self) -> Result<&mut [u8]> {
@@ -186,6 +201,7 @@ impl Drop for Dib {
 pub enum ConnectorState {
     Active,
     Settled,
+    Quiescent,
     Hidden,
 }
 
@@ -194,8 +210,13 @@ pub struct Connector {
     sample: Option<Dib>,
     image: Option<Dib>,
     last_rect: Option<RECT>,
+    visible: bool,
     shown: Vec<(u8, u8, u8)>,
     uploaded: Vec<(u8, u8, u8)>,
+    columns: Vec<(u8, u8, u8)>,
+    col_sums: Vec<[u32; 3]>,
+    last_raw: Vec<u8>,
+    row_alphas: Vec<u8>,
     settled_ticks: u32,
     style: Style,
 }
@@ -235,8 +256,13 @@ impl Connector {
                 sample: None,
                 image: None,
                 last_rect: None,
+                visible: false,
                 shown: Vec::new(),
                 uploaded: Vec::new(),
+                columns: Vec::new(),
+                col_sums: Vec::new(),
+                last_raw: Vec::new(),
+                row_alphas: Vec::new(),
                 settled_ticks: 0,
                 style: Style {
                     pattern: true,
@@ -247,14 +273,25 @@ impl Connector {
     }
 
     pub fn hide(&mut self) {
-        unsafe {
-            if IsWindowVisible(self.hwnd).as_bool() {
+        if self.visible || unsafe { IsWindowVisible(self.hwnd).as_bool() } {
+            unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
+            self.visible = false;
         }
         self.last_rect = None;
         self.shown.clear();
+        self.shown.shrink_to_fit();
         self.uploaded.clear();
+        self.uploaded.shrink_to_fit();
+        self.columns.clear();
+        self.columns.shrink_to_fit();
+        self.col_sums.clear();
+        self.col_sums.shrink_to_fit();
+        self.last_raw.clear();
+        self.last_raw.shrink_to_fit();
+        self.row_alphas.clear();
+        self.row_alphas.shrink_to_fit();
         self.settled_ticks = 0;
         self.sample = None;
         self.image = None;
@@ -270,6 +307,7 @@ impl Connector {
     }
 
     fn update_inner(&mut self, enabled: bool, style: Style) -> Result<ConnectorState> {
+        let style_changed = self.style != style;
         self.style = style;
         if !enabled {
             self.hide();
@@ -293,8 +331,8 @@ impl Connector {
             self.hide();
             return Ok(ConnectorState::Hidden);
         }
-        let taskbar = match find_docked_taskbar(fg) {
-            Some(hwnd) => hwnd,
+        let (taskbar, monitor) = match find_docked_taskbar(fg) {
+            Some(found) => found,
             None => {
                 self.hide();
                 return Ok(ConnectorState::Hidden);
@@ -312,7 +350,7 @@ impl Connector {
             .min(m.strip);
         let width = (bar.right - bar.left).min(MAX_STRIP_WIDTH);
         let height = max_height.min(bar_height + m.seam);
-        if width <= 0 || height < 8 || maximised_above(fg, taskbar, &bar, &m).is_none() {
+        if width <= 0 || height < 8 || maximised_above(fg, monitor, &bar, &m).is_none() {
             self.hide();
             return Ok(ConnectorState::Hidden);
         }
@@ -324,6 +362,10 @@ impl Connector {
         };
         if self.last_rect.is_some_and(|previous| previous != rect) {
             self.hide(); // The old strip must not overlap a relocated capture row.
+        }
+        if style_changed {
+            self.uploaded.clear();
+            self.settled_ticks = 0;
         }
         let sample = Dib::resize(&mut self.sample, width, m.sample_rows)?;
         let screen = unsafe { GetDC(None) };
@@ -348,27 +390,42 @@ impl Connector {
         };
         let _ = unsafe { ReleaseDC(None, screen) };
         capture?;
-        let columns = smooth_scanline(
-            sample.pixels()?,
-            width as usize,
-            m.sample_rows as usize,
-            m.blur,
-        );
+        let raw = sample.pixels()?;
+        let raw_unchanged =
+            !style_changed && !self.columns.is_empty() && self.last_raw.as_slice() == raw;
+        if !raw_unchanged {
+            self.last_raw.clear();
+            self.last_raw.extend_from_slice(raw);
+            smooth_scanline_into(
+                raw,
+                width as usize,
+                m.sample_rows as usize,
+                m.blur,
+                &mut self.col_sums,
+                &mut self.columns,
+            );
+        }
         // Ease toward the new edge so a fast scroll fades instead of snapping.
-        if self.shown.len() != columns.len() || style.reduce_motion {
-            self.shown = columns.clone();
-            self.uploaded.clear();
-        } else {
-            blend_toward(&mut self.shown, &columns);
+        if self.shown.len() != self.columns.len() || style.reduce_motion {
+            if self.shown != self.columns {
+                self.shown.clone_from(&self.columns);
+                self.uploaded.clear();
+            }
+        } else if !raw_unchanged || self.shown != self.columns {
+            blend_toward(&mut self.shown, &self.columns);
         }
         if self.uploaded != self.shown || self.image.is_none() {
             let image = Dib::resize(&mut self.image, width, height)?;
-            fill_gradient_columns(
+            if self.row_alphas.len() != height as usize {
+                fill_row_alphas(height as usize, &mut self.row_alphas);
+            }
+            fill_gradient_columns_with_alphas(
                 image.pixels()?,
                 width as usize,
                 height as usize,
                 &self.shown,
                 &style,
+                &self.row_alphas,
             );
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
@@ -398,32 +455,38 @@ impl Connector {
                     ULW_ALPHA,
                 )?;
             }
-            self.uploaded = self.shown.clone();
+            self.uploaded.clone_from(&self.shown);
         }
         unsafe {
             let previous = GetWindow(taskbar, GW_HWNDPREV).unwrap_or_default();
-            let flags = SWP_NOACTIVATE
-                | SWP_SHOWWINDOW
-                | if previous == self.hwnd {
-                    SWP_NOZORDER
+            let needs_pos = !self.visible || self.last_rect != Some(rect) || previous != self.hwnd;
+            if needs_pos {
+                let flags = SWP_NOACTIVATE
+                    | SWP_SHOWWINDOW
+                    | if previous == self.hwnd {
+                        SWP_NOZORDER
+                    } else {
+                        SET_WINDOW_POS_FLAGS(0)
+                    };
+                let after = if previous.is_invalid() {
+                    HWND_TOPMOST
                 } else {
-                    SET_WINDOW_POS_FLAGS(0)
+                    previous
                 };
-            let after = if previous.is_invalid() {
-                HWND_TOPMOST
-            } else {
-                previous
-            };
-            SetWindowPos(self.hwnd, after, rect.left, rect.top, width, height, flags)?;
+                SetWindowPos(self.hwnd, after, rect.left, rect.top, width, height, flags)?;
+                self.visible = true;
+            }
         }
-        let changing = self.shown != columns || self.uploaded != self.shown;
+        let changing = !raw_unchanged || self.shown != self.columns || self.uploaded != self.shown;
         if changing {
             self.settled_ticks = 0;
         } else {
             self.settled_ticks = self.settled_ticks.saturating_add(1);
         }
         self.last_rect = Some(rect);
-        if self.settled_ticks > 20 {
+        if self.settled_ticks > QUIESCENT_THRESHOLD {
+            Ok(ConnectorState::Quiescent)
+        } else if self.settled_ticks > SETTLED_THRESHOLD {
             Ok(ConnectorState::Settled)
         } else {
             Ok(ConnectorState::Active)
@@ -443,70 +506,270 @@ fn sample_top(overlay_top: i32, rows: i32) -> i32 {
     overlay_top - rows
 }
 
+#[inline]
+fn div_255(v: u32) -> u32 {
+    // Exact floor(v / 255) for all v in 0..=65534 (covers all 0..=255 * 0..=255 products).
+    (v + 1 + (v >> 8)) >> 8
+}
+
+#[inline]
+fn div_by_u64_fast(sum: u64, d: u64, mul: u64) -> u8 {
+    if mul != 0 {
+        ((u128::from(sum) * u128::from(mul)) >> 64) as u8
+    } else {
+        (sum / d) as u8
+    }
+}
+
+#[inline]
+fn fast_u64_recip(d: u64) -> u64 {
+    // Exact ceil(2^64 / d) gives exact floor(x / d) for x <= 255 * d when 255 * d * (d - 1) < 2^64.
+    if (2..=200_000_000).contains(&d) {
+        (((1u128 << 64) + u128::from(d - 1)) / u128::from(d)) as u64
+    } else {
+        0
+    }
+}
+
+pub(crate) fn smooth_scanline_into(
+    raw_bgra: &[u8],
+    width: usize,
+    rows: usize,
+    radius: usize,
+    col_sums: &mut Vec<[u32; 3]>,
+    out: &mut Vec<(u8, u8, u8)>,
+) {
+    out.clear();
+    if width == 0 || rows == 0 {
+        return;
+    }
+    assert_eq!(raw_bgra.len(), width * rows * 4);
+    col_sums.clear();
+    col_sums.resize(width, [0u32; 3]);
+    // Row-major pass: contiguous reads for cache locality and LLVM auto-vectorization.
+    let mut row_weight_sum = 0u64;
+    for (row_idx, row_bytes) in raw_bgra.chunks_exact(width * 4).enumerate() {
+        let w_u64 = ((row_idx + 1) as u64) * ((row_idx + 1) as u64);
+        row_weight_sum += w_u64;
+        let w = w_u64 as u32;
+        let (row_pixels, _) = row_bytes.as_chunks::<4>();
+        for (sum, px) in col_sums.iter_mut().zip(row_pixels) {
+            sum[0] += u32::from(px[2]) * w;
+            sum[1] += u32::from(px[1]) * w;
+            sum[2] += u32::from(px[0]) * w;
+        }
+    }
+    out.reserve(width);
+    let initial_end = radius.saturating_add(1).min(width);
+    let (mut sum_r, mut sum_g, mut sum_b) = (0u64, 0u64, 0u64);
+    for c in &col_sums[..initial_end] {
+        sum_r += u64::from(c[0]);
+        sum_g += u64::from(c[1]);
+        sum_b += u64::from(c[2]);
+    }
+    let window_span = radius.saturating_mul(2).saturating_add(1);
+    if radius > 0 && window_span < width {
+        // Left border: window grows from [0..radius+1] to [0..2*radius].
+        for x in 0..radius {
+            if x > 0 {
+                let c = col_sums[x + radius];
+                sum_r += u64::from(c[0]);
+                sum_g += u64::from(c[1]);
+                sum_b += u64::from(c[2]);
+            }
+            let count = (x + radius + 1) as u64 * row_weight_sum;
+            out.push((
+                (sum_r / count) as u8,
+                (sum_g / count) as u8,
+                (sum_b / count) as u8,
+            ));
+        }
+        // Interior: constant window width, single multiply-high replaces hardware division.
+        let mid_count = window_span as u64 * row_weight_sum;
+        let mid_mul = fast_u64_recip(mid_count);
+        // Enter x = radius: add col_sums[2 * radius], nothing dropped yet.
+        {
+            let c = col_sums[radius * 2];
+            sum_r += u64::from(c[0]);
+            sum_g += u64::from(c[1]);
+            sum_b += u64::from(c[2]);
+            out.push((
+                div_by_u64_fast(sum_r, mid_count, mid_mul),
+                div_by_u64_fast(sum_g, mid_count, mid_mul),
+                div_by_u64_fast(sum_b, mid_count, mid_mul),
+            ));
+        }
+        let mid_end = width - radius;
+        for (&add_c, &sub_c) in col_sums[window_span..width]
+            .iter()
+            .zip(col_sums[..mid_end - radius - 1].iter())
+        {
+            sum_r = sum_r + u64::from(add_c[0]) - u64::from(sub_c[0]);
+            sum_g = sum_g + u64::from(add_c[1]) - u64::from(sub_c[1]);
+            sum_b = sum_b + u64::from(add_c[2]) - u64::from(sub_c[2]);
+            out.push((
+                div_by_u64_fast(sum_r, mid_count, mid_mul),
+                div_by_u64_fast(sum_g, mid_count, mid_mul),
+                div_by_u64_fast(sum_b, mid_count, mid_mul),
+            ));
+        }
+        // Right border: window shrinks from right edge.
+        for x in mid_end..width {
+            let drop_c = col_sums[x - radius - 1];
+            sum_r -= u64::from(drop_c[0]);
+            sum_g -= u64::from(drop_c[1]);
+            sum_b -= u64::from(drop_c[2]);
+            let count = (width - (x - radius)) as u64 * row_weight_sum;
+            out.push((
+                (sum_r / count) as u8,
+                (sum_g / count) as u8,
+                (sum_b / count) as u8,
+            ));
+        }
+    } else if radius == 0 {
+        let mul = fast_u64_recip(row_weight_sum);
+        for c in col_sums.iter() {
+            out.push((
+                div_by_u64_fast(u64::from(c[0]), row_weight_sum, mul),
+                div_by_u64_fast(u64::from(c[1]), row_weight_sum, mul),
+                div_by_u64_fast(u64::from(c[2]), row_weight_sum, mul),
+            ));
+        }
+    } else {
+        let mut cur_start = 0usize;
+        let mut cur_end = initial_end;
+        for x in 0..width {
+            let start = x.saturating_sub(radius);
+            let end = x.saturating_add(radius).saturating_add(1).min(width);
+            while cur_end < end {
+                let c = col_sums[cur_end];
+                sum_r += u64::from(c[0]);
+                sum_g += u64::from(c[1]);
+                sum_b += u64::from(c[2]);
+                cur_end += 1;
+            }
+            while cur_start < start {
+                let c = col_sums[cur_start];
+                sum_r -= u64::from(c[0]);
+                sum_g -= u64::from(c[1]);
+                sum_b -= u64::from(c[2]);
+                cur_start += 1;
+            }
+            let count = (end - start) as u64 * row_weight_sum;
+            out.push((
+                (sum_r / count) as u8,
+                (sum_g / count) as u8,
+                (sum_b / count) as u8,
+            ));
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn smooth_scanline(
     raw_bgra: &[u8],
     width: usize,
     rows: usize,
     radius: usize,
 ) -> Vec<(u8, u8, u8)> {
-    if width == 0 || rows == 0 {
-        return Vec::new();
+    let mut col_sums = Vec::new();
+    let mut out = Vec::new();
+    smooth_scanline_into(raw_bgra, width, rows, radius, &mut col_sums, &mut out);
+    out
+}
+
+#[inline]
+fn blend_channel(old: u8, new: u8) -> u8 {
+    // Exact integer equivalent of BLEND_STEP = 0.5 with half-away-from-zero rounding.
+    if old.abs_diff(new) <= 1 {
+        new
+    } else {
+        ((u16::from(old) + u16::from(new) + 1) >> 1) as u8
     }
-    assert_eq!(raw_bgra.len(), width * rows * 4);
-    // Rows closer to the window edge dominate, so newly scrolled content registers immediately.
-    let mut prefix = vec![(0u64, 0u64, 0u64); width + 1];
-    let mut weights = vec![0u64; width + 1];
-    for x in 0..width {
-        let (mut red, mut green, mut blue) = prefix[x];
-        let mut weight = weights[x];
-        for row in 0..rows {
-            let at = (row * width + x) * 4;
-            let w = ((row + 1) as u64) * ((row + 1) as u64);
-            red += u64::from(raw_bgra[at + 2]) * w;
-            green += u64::from(raw_bgra[at + 1]) * w;
-            blue += u64::from(raw_bgra[at]) * w;
-            weight += w;
-        }
-        prefix[x + 1] = (red, green, blue);
-        weights[x + 1] = weight;
-    }
-    (0..width)
-        .map(|x| {
-            let start = x.saturating_sub(radius);
-            let end = x.saturating_add(radius).saturating_add(1).min(width);
-            let count = weights[end] - weights[start];
-            let a = prefix[start];
-            let b = prefix[end];
-            (
-                ((b.0 - a.0) / count) as u8,
-                ((b.1 - a.1) / count) as u8,
-                ((b.2 - a.2) / count) as u8,
-            )
-        })
-        .collect()
 }
 
 /// Exponential ease used for the cross-fade between two sampled edges.
 pub(crate) fn blend_toward(shown: &mut [(u8, u8, u8)], target: &[(u8, u8, u8)]) {
-    fn step(old: u8, new: u8) -> u8 {
-        let diff = f32::from(new) - f32::from(old);
-        if diff.abs() <= 1.0 {
-            return new;
-        }
-        (f32::from(old) + diff * BLEND_STEP)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    }
     for (slot, &(red, green, blue)) in shown.iter_mut().zip(target) {
         let (old_red, old_green, old_blue) = *slot;
         *slot = (
-            step(old_red, red),
-            step(old_green, green),
-            step(old_blue, blue),
+            blend_channel(old_red, red),
+            blend_channel(old_green, green),
+            blend_channel(old_blue, blue),
         );
     }
 }
 
+pub(crate) fn fill_row_alphas(height: usize, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(height);
+    let span = height.saturating_sub(1).max(1) as f32;
+    for row in 0..height {
+        let falloff = 1.0 - row as f32 / span;
+        let alpha = (TOP_ALPHA * falloff.powf(FALLOFF) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        out.push(alpha);
+    }
+}
+
+pub(crate) fn fill_gradient_columns_with_alphas(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    columns: &[(u8, u8, u8)],
+    style: &Style,
+    row_alphas: &[u8],
+) {
+    assert_eq!(columns.len(), width);
+    assert_eq!(pixels.len(), width * height * 4);
+    assert_eq!(row_alphas.len(), height);
+    let step = metrics(96).grid_step.max(8) as usize;
+    let grid_alpha = (GRID_ALPHA * 255.0) as u32;
+    let mut lut = [0u8; 256];
+    for (row, (row_pixels, &alpha_u8)) in pixels
+        .chunks_exact_mut(width * 4)
+        .zip(row_alphas.iter())
+        .enumerate()
+    {
+        if alpha_u8 == 0 {
+            row_pixels.fill(0);
+            continue;
+        }
+        let alpha = u32::from(alpha_u8);
+        for (i, slot) in lut.iter_mut().enumerate() {
+            *slot = div_255((i as u32) * alpha) as u8;
+        }
+        let (row_px, _) = row_pixels.as_chunks_mut::<4>();
+        for (px, &(red, green, blue)) in row_px.iter_mut().zip(columns) {
+            *px = [
+                lut[usize::from(blue)],
+                lut[usize::from(green)],
+                lut[usize::from(red)],
+                alpha_u8,
+            ];
+        }
+        if style.pattern {
+            // Apply faint grid lines while this row is hot in L1 cache.
+            let shade = div_255(grid_alpha * alpha) as u8;
+            if row % step == 0 {
+                for px in row_px.iter_mut().step_by(step) {
+                    px[0] = px[0].saturating_add(shade).min(alpha_u8);
+                    px[1] = px[1].saturating_add(shade).min(alpha_u8);
+                    px[2] = px[2].saturating_add(shade).min(alpha_u8);
+                }
+            } else {
+                for px in row_px.iter_mut().step_by(step) {
+                    px[0] = px[0].saturating_sub(shade);
+                    px[1] = px[1].saturating_sub(shade);
+                    px[2] = px[2].saturating_sub(shade);
+                }
+            }
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn fill_gradient_columns(
     pixels: &mut [u8],
     width: usize,
@@ -514,56 +777,18 @@ pub(crate) fn fill_gradient_columns(
     columns: &[(u8, u8, u8)],
     style: &Style,
 ) {
-    assert_eq!(columns.len(), width);
-    assert_eq!(pixels.len(), width * height * 4);
-    let span = height.saturating_sub(1).max(1) as f32;
-    let step = metrics(96).grid_step.max(8) as usize;
-    for row in 0..height {
-        let falloff = 1.0 - row as f32 / span;
-        let alpha = (TOP_ALPHA * falloff.powf(FALLOFF) * 255.0).round() as u32;
-        for (x, &(red, green, blue)) in columns.iter().enumerate() {
-            let at = (row * width + x) * 4;
-            pixels[at..at + 4].copy_from_slice(&[
-                (u32::from(blue) * alpha / 255) as u8,
-                (u32::from(green) * alpha / 255) as u8,
-                (u32::from(red) * alpha / 255) as u8,
-                alpha as u8,
-            ]);
+    let mut row_alphas = Vec::new();
+    fill_row_alphas(height, &mut row_alphas);
+    fill_gradient_columns_with_alphas(pixels, width, height, columns, style, &row_alphas);
+}
+
+pub fn has_eligible_foreground() -> bool {
+    unsafe {
+        if GetSystemMetrics(SM_REMOTESESSION) != 0 || !dwm_composition_enabled() {
+            return false;
         }
-    }
-    if !style.pattern {
-        return;
-    }
-    // Faint grid lines, fading with the same vertical falloff as the gradient.
-    let grid_alpha = (GRID_ALPHA * 255.0) as u32;
-    for row in 0..height {
-        let falloff = 1.0 - row as f32 / span;
-        let alpha = (TOP_ALPHA * falloff.powf(FALLOFF) * 255.0).round() as u32;
-        if alpha == 0 {
-            continue;
-        }
-        let shade = (grid_alpha * alpha) / 255;
-        for x in (0..width).step_by(step) {
-            let at = (row * width + x) * 4;
-            let (mut blue, mut green, mut red) = (
-                u32::from(pixels[at]),
-                u32::from(pixels[at + 1]),
-                u32::from(pixels[at + 2]),
-            );
-            if row % step == 0 {
-                // Horizontal lines brighten the sampled colour instead of darkening it.
-                blue = blue.saturating_add(shade);
-                green = green.saturating_add(shade);
-                red = red.saturating_add(shade);
-            } else {
-                blue = blue.saturating_sub(shade);
-                green = green.saturating_sub(shade);
-                red = red.saturating_sub(shade);
-            }
-            pixels[at] = (blue & 0xff) as u8;
-            pixels[at + 1] = (green & 0xff) as u8;
-            pixels[at + 2] = (red & 0xff) as u8;
-        }
+        let fg = GetForegroundWindow();
+        !fg.is_invalid() && IsWindowVisible(fg).as_bool() && IsZoomed(fg).as_bool()
     }
 }
 
@@ -572,16 +797,29 @@ fn dwm_composition_enabled() -> bool {
     unsafe { DwmIsCompositionEnabled().map(BOOL::as_bool).unwrap_or(true) }
 }
 
+const SHELL_CLASSES: [&[u8]; 6] = [
+    b"Shell_TrayWnd",
+    b"Shell_SecondaryTrayWnd",
+    b"Progman",
+    b"WorkerW",
+    b"Windows.UI.Core.CoreWindow",
+    b"TransparentBar.Connector",
+];
+
+#[inline]
+fn is_shell_class_utf16(class: &[u16]) -> bool {
+    SHELL_CLASSES.iter().any(|&name| {
+        class.len() == name.len()
+            && class
+                .iter()
+                .zip(name.iter())
+                .all(|(&w, &b)| w == u16::from(b))
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_shell_class(class: &str) -> bool {
-    matches!(
-        class,
-        "Shell_TrayWnd"
-            | "Shell_SecondaryTrayWnd"
-            | "Progman"
-            | "WorkerW"
-            | "Windows.UI.Core.CoreWindow"
-            | "TransparentBar.Connector"
-    )
+    SHELL_CLASSES.contains(&class.as_bytes())
 }
 
 pub(crate) fn is_docked_above_taskbar(window: &RECT, bar: &RECT, m: &Metrics) -> bool {
@@ -601,7 +839,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
     DefWindowProcW(hwnd, message, wp, lp)
 }
 
-pub(crate) fn find_docked_taskbar(fg: HWND) -> Option<HWND> {
+pub(crate) fn find_docked_taskbar(fg: HWND) -> Option<(HWND, HMONITOR)> {
     unsafe {
         let fg_monitor = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
         if fg_monitor.is_invalid() {
@@ -612,7 +850,7 @@ pub(crate) fn find_docked_taskbar(fg: HWND) -> Option<HWND> {
             if !primary.is_invalid()
                 && MonitorFromWindow(primary, MONITOR_DEFAULTTONULL) == fg_monitor
             {
-                return Some(primary);
+                return Some((primary, fg_monitor));
             }
         }
         // Secondary taskbar on multi-monitor setups
@@ -622,7 +860,7 @@ pub(crate) fn find_docked_taskbar(fg: HWND) -> Option<HWND> {
                 break;
             }
             if MonitorFromWindow(next, MONITOR_DEFAULTTONULL) == fg_monitor {
-                return Some(next);
+                return Some((next, fg_monitor));
             }
             child = next;
         }
@@ -630,18 +868,17 @@ pub(crate) fn find_docked_taskbar(fg: HWND) -> Option<HWND> {
     }
 }
 
-fn maximised_above(fg: HWND, taskbar: HWND, bar: &RECT, m: &Metrics) -> Option<RECT> {
+fn maximised_above(fg: HWND, monitor: HMONITOR, bar: &RECT, m: &Metrics) -> Option<RECT> {
     unsafe {
-        if let Ok(state) = SHQueryUserNotificationState() {
-            if matches!(
-                state,
-                QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE | QUNS_APP
-            ) {
-                return None;
-            }
+        // Fast local checks first to avoid unnecessary shell RPCs on ineligible windows.
+        let mut name = [0u16; 64];
+        let length = GetClassNameW(fg, &mut name);
+        if length <= 0 || is_shell_class_utf16(&name[..length as usize]) {
+            return None;
         }
-        let monitor = MonitorFromWindow(taskbar, MONITOR_DEFAULTTONULL);
-        if monitor.is_invalid() || MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) != monitor {
+        let mut rect = RECT::default();
+        GetWindowRect(fg, &mut rect).ok()?;
+        if !is_docked_above_taskbar(&rect, bar, m) {
             return None;
         }
         let mut info = MONITORINFO {
@@ -657,14 +894,15 @@ fn maximised_above(fg: HWND, taskbar: HWND, bar: &RECT, m: &Metrics) -> Option<R
         {
             return None;
         }
-        let mut name = [0u16; 64];
-        let length = GetClassNameW(fg, &mut name);
-        if length <= 0 || is_shell_class(&String::from_utf16_lossy(&name[..length as usize])) {
-            return None;
+        if let Ok(state) = SHQueryUserNotificationState() {
+            if matches!(
+                state,
+                QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE | QUNS_APP
+            ) {
+                return None;
+            }
         }
-        let mut rect = RECT::default();
-        GetWindowRect(fg, &mut rect).ok()?;
-        is_docked_above_taskbar(&rect, bar, m).then_some(rect)
+        Some(rect)
     }
 }
 
@@ -830,5 +1068,148 @@ mod tests {
             assert_eq!(smooth_scanline(destination.pixels()?, 3, 4, 0), colors);
         }
         Ok(())
+    }
+
+    #[test]
+    fn pattern_brightening_clamps_to_premultiplied_alpha_without_wraparound() {
+        let width = 64;
+        let height = 32;
+        let white = vec![(255u8, 255u8, 255u8); width];
+        let mut pixels = vec![0u8; width * height * 4];
+        fill_gradient_columns(
+            &mut pixels,
+            width,
+            height,
+            &white,
+            &Style {
+                pattern: true,
+                reduce_motion: false,
+            },
+        );
+        for &[b, g, r, a] in pixels.as_chunks::<4>().0 {
+            assert!(
+                b <= a && g <= a && r <= a,
+                "premultiplied BGRA violated: ({b}, {g}, {r}, {a})"
+            );
+        }
+        // Top-left pixel is on both horizontal and vertical grid lines (row=0, x=0): must stay bright, never wrap.
+        let a0 = pixels[3];
+        assert!(a0 > 200);
+        assert_eq!((pixels[0], pixels[1], pixels[2]), (a0, a0, a0));
+    }
+
+    #[test]
+    fn div_255_is_bit_exact_for_all_u8_products() {
+        for c in 0u32..=255 {
+            for a in 0u32..=255 {
+                let p = c * a;
+                assert_eq!(div_255(p), p / 255, "mismatch at c={c}, a={a}");
+            }
+        }
+    }
+
+    #[test]
+    fn blend_channel_matches_float_half_step_for_all_u8_pairs() {
+        for old in 0u8..=255 {
+            for new in 0u8..=255 {
+                let diff = f32::from(new) - f32::from(old);
+                let expected = if diff.abs() <= 1.0 {
+                    new
+                } else {
+                    (f32::from(old) + diff * 0.5).round().clamp(0.0, 255.0) as u8
+                };
+                assert_eq!(
+                    blend_channel(old, new),
+                    expected,
+                    "mismatch at old={old}, new={new}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn smooth_scanline_into_matches_reference_and_reuses_buffers() {
+        fn reference(
+            raw_bgra: &[u8],
+            width: usize,
+            rows: usize,
+            radius: usize,
+        ) -> Vec<(u8, u8, u8)> {
+            let mut prefix = vec![(0u64, 0u64, 0u64); width + 1];
+            let mut weights = vec![0u64; width + 1];
+            for x in 0..width {
+                let (mut r, mut g, mut b) = prefix[x];
+                let mut wsum = weights[x];
+                for row in 0..rows {
+                    let at = (row * width + x) * 4;
+                    let w = ((row + 1) as u64) * ((row + 1) as u64);
+                    r += u64::from(raw_bgra[at + 2]) * w;
+                    g += u64::from(raw_bgra[at + 1]) * w;
+                    b += u64::from(raw_bgra[at]) * w;
+                    wsum += w;
+                }
+                prefix[x + 1] = (r, g, b);
+                weights[x + 1] = wsum;
+            }
+            (0..width)
+                .map(|x| {
+                    let start = x.saturating_sub(radius);
+                    let end = x.saturating_add(radius).saturating_add(1).min(width);
+                    let count = weights[end] - weights[start];
+                    let a = prefix[start];
+                    let b = prefix[end];
+                    (
+                        ((b.0 - a.0) / count) as u8,
+                        ((b.1 - a.1) / count) as u8,
+                        ((b.2 - a.2) / count) as u8,
+                    )
+                })
+                .collect()
+        }
+
+        let mut col_sums = Vec::new();
+        let mut out = Vec::new();
+        for width in [1usize, 2, 3, 5, 16, 17, 18, 64, 300] {
+            for rows in [1usize, 2, 4, 8] {
+                let mut raw = vec![0u8; width * rows * 4];
+                for (i, byte) in raw.iter_mut().enumerate() {
+                    *byte = ((i.wrapping_mul(37) + 13) & 0xff) as u8;
+                }
+                for radius in [0usize, 1, 2, 8, 12] {
+                    smooth_scanline_into(&raw, width, rows, radius, &mut col_sums, &mut out);
+                    let expected = reference(&raw, width, rows, radius);
+                    assert_eq!(out, expected, "width={width} rows={rows} radius={radius}");
+                }
+            }
+        }
+        // Second call at same dimensions reuses exact allocations (pointers stay stable).
+        let raw = vec![128u8; 300 * 4 * 4];
+        smooth_scanline_into(&raw, 300, 4, 8, &mut col_sums, &mut out);
+        let sums_ptr = col_sums.as_ptr();
+        let out_ptr = out.as_ptr();
+        smooth_scanline_into(&raw, 300, 4, 8, &mut col_sums, &mut out);
+        assert_eq!(col_sums.as_ptr(), sums_ptr);
+        assert_eq!(out.as_ptr(), out_ptr);
+    }
+
+    #[test]
+    fn is_shell_class_utf16_matches_str_list() {
+        for name in [
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+            "Progman",
+            "WorkerW",
+            "Windows.UI.Core.CoreWindow",
+            "TransparentBar.Connector",
+        ] {
+            let wide: Vec<u16> = name.encode_utf16().collect();
+            assert!(is_shell_class_utf16(&wide), "{name}");
+            assert!(is_shell_class(name));
+        }
+        for other in ["Chrome_WidgetWin_1", "Notepad", "Shell_TrayWnd2", ""] {
+            let wide: Vec<u16> = other.encode_utf16().collect();
+            assert!(!is_shell_class_utf16(&wide), "{other}");
+            assert!(!is_shell_class(other));
+        }
     }
 }

@@ -84,8 +84,8 @@
         <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
         <RemoveFolder Id="RemoveLocalProgramsFolder" Directory="LocalProgramsFolder" On="uninstall" />
       </Component>
-      <!-- Keep prior versioned bridge DLLs intact during upgrade uninstall so Explorer handles never trigger RemoveFiles conflicts; transparentbar.exe sweeps unlocked older DLLs on startup. -->
-      <Component Id="BridgeDllComponent" Directory="INSTALLFOLDER" Guid="$(var.BridgeGuid)" Permanent="yes">
+      <!-- Windows Installer removes this component on uninstall and schedules reboot deletion via MoveFileEx if Explorer still holds the DLL mapped. -->
+      <Component Id="BridgeDllComponent" Directory="INSTALLFOLDER" Guid="$(var.BridgeGuid)">
         <RegistryValue Root="HKCU" Key="Software\TransparentBar\Installer" Name="BridgeDll" Type="string" Value="$(var.Version)" KeyPath="yes" />
         <File Id="BridgeDll" Source="dist\TransparentBar\transparentbar_bridge-$(var.Version).dll" />
       </Component>

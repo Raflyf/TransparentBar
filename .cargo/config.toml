@@ -1,0 +1,7 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "control-flow-guard=checks",
+    "-C", "link-arg=/DEPENDENTLOADFLAG:0x800",
+    "-C", "link-arg=/CETCOMPAT",
+]

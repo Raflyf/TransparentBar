@@ -15,6 +15,7 @@ use windows::{
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASES_URL: PCWSTR = w!("https://github.com/Raflyf/TransparentBar/releases/latest");
+const EXPECTED_RELEASE_TAG_PREFIX: &str = "https://github.com/Raflyf/TransparentBar/releases/tag/";
 static CHECKING: AtomicBool = AtomicBool::new(false);
 static AVAILABLE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
@@ -54,36 +55,45 @@ pub fn check_in_background(hwnd: HWND, manual: bool, notify_message: u32) {
         return;
     }
     let hwnd_raw = hwnd.0 as usize;
-    std::thread::spawn(move || {
-        let outcome = fetch_latest_tag();
-        CHECKING.store(false, Ordering::Release);
-        let target = HWND(hwnd_raw as *mut core::ffi::c_void);
-        match outcome {
-            Ok(tag) if is_newer(&tag, CURRENT_VERSION) => {
-                set_available_tag(tag);
-                unsafe {
-                    let _ = PostMessageW(
-                        target,
-                        notify_message,
-                        WPARAM(usize::from(manual)),
-                        LPARAM(1),
-                    );
-                }
-            }
-            Ok(tag) if manual => {
-                if is_newer(&tag, CURRENT_VERSION) {
+    let spawn = std::thread::Builder::new()
+        .name("update-check".into())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let outcome = fetch_latest_tag();
+            CHECKING.store(false, Ordering::Release);
+            let target = HWND(hwnd_raw as *mut core::ffi::c_void);
+            match outcome {
+                Ok(tag) if is_newer(&tag, CURRENT_VERSION) => {
                     set_available_tag(tag);
+                    unsafe {
+                        let _ = PostMessageW(
+                            target,
+                            notify_message,
+                            WPARAM(usize::from(manual)),
+                            LPARAM(1),
+                        );
+                    }
                 }
-                unsafe {
-                    let _ = PostMessageW(target, notify_message, WPARAM(1), LPARAM(0));
+                Ok(tag) if manual => {
+                    if is_newer(&tag, CURRENT_VERSION) {
+                        set_available_tag(tag);
+                    }
+                    unsafe {
+                        let _ = PostMessageW(target, notify_message, WPARAM(1), LPARAM(0));
+                    }
                 }
+                Err(_) if manual => unsafe {
+                    let _ = PostMessageW(target, notify_message, WPARAM(1), LPARAM(-1));
+                },
+                _ => unsafe {
+                    // Notify the main loop so cold WinHTTP/Crypt32 pages can be trimmed from the working set.
+                    let _ = PostMessageW(target, notify_message, WPARAM(0), LPARAM(2));
+                },
             }
-            Err(_) if manual => unsafe {
-                let _ = PostMessageW(target, notify_message, WPARAM(1), LPARAM(-1));
-            },
-            _ => (),
-        }
-    });
+        });
+    if spawn.is_err() {
+        CHECKING.store(false, Ordering::Release);
+    }
 }
 
 pub fn show_balloon(hwnd: HWND, title: &str, body: &str) {
@@ -109,23 +119,80 @@ fn copy_wide(dest: &mut [u16], text: &str) {
     }
 }
 
+unsafe fn open_hardened_session() -> Result<WinHttpHandle> {
+    let session = WinHttpHandle(WinHttpOpen(
+        w!("TransparentBar"),
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        PCWSTR::null(),
+        PCWSTR::null(),
+        0,
+    ));
+    if session.0.is_null() {
+        return Err(Error::from_win32());
+    }
+    WinHttpSetTimeouts(session.0, 5000, 5000, 5000, 5000)?;
+    let tls_12_13 = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+    if WinHttpSetOption(
+        Some(session.0),
+        WINHTTP_OPTION_SECURE_PROTOCOLS,
+        Some(&tls_12_13.to_ne_bytes()),
+    )
+    .is_err()
+    {
+        let tls_12 = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+        WinHttpSetOption(
+            Some(session.0),
+            WINHTTP_OPTION_SECURE_PROTOCOLS,
+            Some(&tls_12.to_ne_bytes()),
+        )?;
+    }
+    Ok(session)
+}
+
+unsafe fn harden_request(request: *mut core::ffi::c_void) -> Result<()> {
+    let revocation = WINHTTP_ENABLE_SSL_REVOCATION;
+    WinHttpSetOption(
+        Some(request),
+        WINHTTP_OPTION_ENABLE_FEATURE,
+        Some(&revocation.to_ne_bytes()),
+    )?;
+    let autologon = WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH;
+    WinHttpSetOption(
+        Some(request),
+        WINHTTP_OPTION_AUTOLOGON_POLICY,
+        Some(&autologon.to_ne_bytes()),
+    )?;
+    let redirect = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    WinHttpSetOption(
+        Some(request),
+        WINHTTP_OPTION_REDIRECT_POLICY,
+        Some(&redirect.to_ne_bytes()),
+    )?;
+    Ok(())
+}
+
+unsafe fn query_http_status(request: *mut core::ffi::c_void) -> Result<u32> {
+    let mut status_code = 0u32;
+    let mut bytes = std::mem::size_of::<u32>() as u32;
+    let mut index = 0u32;
+    WinHttpQueryHeaders(
+        request,
+        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        PCWSTR::null(),
+        Some((&mut status_code as *mut u32).cast()),
+        &mut bytes,
+        &mut index,
+    )?;
+    Ok(status_code)
+}
+
 fn fetch_latest_tag() -> Result<String> {
     fetch_tag_from_redirect().or_else(|_| fetch_tag_from_api())
 }
 
 fn fetch_tag_from_redirect() -> Result<String> {
     unsafe {
-        let session = WinHttpHandle(WinHttpOpen(
-            w!("TransparentBar"),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        ));
-        if session.0.is_null() {
-            return Err(Error::from_win32());
-        }
-        WinHttpSetTimeouts(session.0, 5000, 5000, 5000, 5000)?;
+        let session = open_hardened_session()?;
         let connect = WinHttpHandle(WinHttpConnect(
             session.0,
             w!("github.com"),
@@ -147,14 +214,16 @@ fn fetch_tag_from_redirect() -> Result<String> {
         if request.0.is_null() {
             return Err(Error::from_win32());
         }
-        let policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-        WinHttpSetOption(
-            Some(request.0),
-            WINHTTP_OPTION_REDIRECT_POLICY,
-            Some(&policy.to_ne_bytes()),
-        )?;
+        harden_request(request.0)?;
         WinHttpSendRequest(request.0, None, None, 0, 0, 0)?;
         WinHttpReceiveResponse(request.0, std::ptr::null_mut())?;
+        let status = query_http_status(request.0)?;
+        if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+            return Err(Error::new(
+                E_FAIL,
+                format!("Unexpected redirect status HTTP {status}."),
+            ));
+        }
         let mut buffer = [0u16; 512];
         let mut bytes = std::mem::size_of_val(&buffer) as u32;
         let mut index = 0u32;
@@ -175,17 +244,7 @@ fn fetch_tag_from_redirect() -> Result<String> {
 
 fn fetch_tag_from_api() -> Result<String> {
     unsafe {
-        let session = WinHttpHandle(WinHttpOpen(
-            w!("TransparentBar"),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        ));
-        if session.0.is_null() {
-            return Err(Error::from_win32());
-        }
-        WinHttpSetTimeouts(session.0, 5000, 5000, 5000, 5000)?;
+        let session = open_hardened_session()?;
         let connect = WinHttpHandle(WinHttpConnect(
             session.0,
             w!("api.github.com"),
@@ -207,9 +266,17 @@ fn fetch_tag_from_api() -> Result<String> {
         if request.0.is_null() {
             return Err(Error::from_win32());
         }
+        harden_request(request.0)?;
         WinHttpSendRequest(request.0, None, None, 0, 0, 0)?;
         WinHttpReceiveResponse(request.0, std::ptr::null_mut())?;
-        let mut body = Vec::new();
+        let status = query_http_status(request.0)?;
+        if status != 200 {
+            return Err(Error::new(
+                E_FAIL,
+                format!("GitHub API returned HTTP {status}."),
+            ));
+        }
+        let mut body = Vec::with_capacity(4096);
         let mut chunk = [0u8; 2048];
         loop {
             let mut read = 0u32;
@@ -231,12 +298,9 @@ fn fetch_tag_from_api() -> Result<String> {
 }
 
 pub(crate) fn extract_tag_from_location(location: &str) -> Option<String> {
-    let (_, tail) = location.rsplit_once("/releases/tag/")?;
-    let tag = tail
-        .trim_end_matches('\0')
-        .split(['?', '#', '/'])
-        .next()?
-        .trim();
+    let trimmed = location.trim_end_matches('\0').trim();
+    let tail = trimmed.strip_prefix(EXPECTED_RELEASE_TAG_PREFIX)?;
+    let tag = tail.split(['?', '#', '/']).next()?.trim();
     if parse_semver(tag).is_some() {
         Some(tag.to_string())
     } else {

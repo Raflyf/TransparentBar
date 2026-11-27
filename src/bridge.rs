@@ -84,8 +84,10 @@ struct IUIElement_Vtbl {
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc::{self, SyncSender},
         Arc, Mutex,
     },
 };
@@ -99,9 +101,46 @@ use windows::{
     UI::Core::{CoreDispatcher, CoreDispatcherPriority, DispatchedHandler},
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElementRole {
+    Other,
+    TaskbarFrame,
+    BackgroundFill,
+    BackgroundStroke,
+}
+
+#[inline]
+fn wide_eq_ascii(wide: &[u16], ascii: &[u8]) -> bool {
+    wide.len() == ascii.len()
+        && wide
+            .iter()
+            .zip(ascii.iter())
+            .all(|(&w, &b)| w == u16::from(b))
+}
+
+#[inline]
+fn classify_element(kind: &[u16], name: &[u16]) -> ElementRole {
+    if wide_eq_ascii(kind, b"Taskbar.TaskbarFrame") {
+        ElementRole::TaskbarFrame
+    } else if wide_eq_ascii(kind, b"Windows.UI.Xaml.Shapes.Rectangle") {
+        if wide_eq_ascii(name, b"BackgroundFill") {
+            ElementRole::BackgroundFill
+        } else if wide_eq_ascii(name, b"BackgroundStroke") {
+            ElementRole::BackgroundStroke
+        } else {
+            ElementRole::Other
+        }
+    } else {
+        ElementRole::Other
+    }
+}
+
 #[derive(Default)]
 struct TreeState {
     epoch: u64,
+    owner_registered: bool,
+    last_ready: bool,
+    last_dirty: bool,
     nodes: HashMap<u64, u64>,
     frames: HashSet<u64>,
     saved: HashMap<u64, (IUIElement, f64)>,
@@ -111,6 +150,22 @@ struct TreeState {
 thread_local! { static TREE: RefCell<TreeState> = RefCell::new(TreeState::default()); }
 static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SESSION_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// RAII COM apartment guard ensuring COM objects in inner scopes drop before `CoUninitialize`.
+struct ComGuard;
+impl ComGuard {
+    fn init_mta() -> Result<Self> {
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
+        Ok(Self)
+    }
+}
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+}
 
 #[derive(Clone)]
 enum UiDispatcher {
@@ -182,12 +237,14 @@ struct Session {
     owners: Arc<Mutex<HashMap<u32, OwnerState>>>,
     restoring: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
+    last_any_ready: Arc<AtomicBool>,
     ready: Arc<OwnedHandle>,
     failed: Arc<OwnedHandle>,
     done: Arc<OwnedHandle>,
     inspect: bool,
     seen: Arc<AtomicBool>,
     status: Arc<protocol::StatusChannel>,
+    log_tx: SyncSender<String>,
 }
 struct OwnedHandle(usize);
 impl OwnedHandle {
@@ -217,6 +274,22 @@ fn ancestor_frame(state: &TreeState, mut handle: u64) -> Option<u64> {
     None
 }
 
+fn reaches_root_without_frame(state: &TreeState, mut handle: u64) -> bool {
+    for _ in 0..64 {
+        if state.frames.contains(&handle) {
+            return false;
+        }
+        let Some(&parent) = state.nodes.get(&handle) else {
+            return false;
+        };
+        if parent == 0 || parent == handle {
+            return true;
+        }
+        handle = parent;
+    }
+    false
+}
+
 impl TreeState {
     fn prepare(&mut self, epoch: u64) -> Result<()> {
         if self.epoch == epoch {
@@ -228,6 +301,7 @@ impl TreeState {
                 "Previous session taskbar backup has not been restored yet.",
             ));
         }
+        // `saved` is guaranteed empty here, so replacing `*self` drops zero COM objects.
         *self = Self {
             epoch,
             ..Self::default()
@@ -235,6 +309,9 @@ impl TreeState {
         Ok(())
     }
     fn candidates(&self) -> Vec<(u64, u64, bool)> {
+        if self.pending.is_empty() || self.frames.is_empty() {
+            return Vec::new();
+        }
         self.pending
             .iter()
             .filter_map(|(handle, fill)| {
@@ -246,6 +323,26 @@ impl TreeState {
             })
             .collect()
     }
+    fn prune_non_frame_pending(&mut self) {
+        if self.pending.is_empty() || self.frames.is_empty() {
+            return;
+        }
+        let drop_keys: Vec<u64> = self
+            .pending
+            .keys()
+            .copied()
+            .filter(|handle| {
+                self.targets.contains_key(handle)
+                    || self
+                        .nodes
+                        .get(handle)
+                        .is_some_and(|&parent| reaches_root_without_frame(self, parent))
+            })
+            .collect();
+        for key in drop_keys {
+            self.pending.remove(&key);
+        }
+    }
     fn has_background(&self) -> bool {
         self.targets
             .values()
@@ -253,7 +350,18 @@ impl TreeState {
     }
 }
 
+fn flush_logs(rx: &mpsc::Receiver<String>) {
+    for entry in rx.try_iter() {
+        protocol::trace(&entry);
+    }
+}
+
 impl Session {
+    fn log(&self, entry: impl Into<String>) {
+        // Non-blocking send to worker thread; never perform synchronous disk I/O on Explorer's UI thread.
+        let _ = self.log_tx.try_send(entry.into());
+    }
+
     fn owner_dispatcher(&self) -> Result<Option<(u32, UiDispatcher)>> {
         let thread = unsafe { GetCurrentThreadId() };
         {
@@ -287,7 +395,7 @@ impl Session {
                 dirty: false,
             },
         );
-        protocol::trace(&format!("Bridge.Owner thread={thread}"));
+        self.log(format!("Bridge.Owner thread={thread}"));
         Ok(Some((thread, dispatcher)))
     }
 
@@ -313,12 +421,15 @@ impl Session {
             owner.dirty = dirty;
         }
         let any_ready = owners.values().any(|owner| owner.ready);
-        unsafe {
-            if any_ready {
-                self.status.stage(10);
-                SetEvent(self.ready.raw())?;
-            } else {
-                ResetEvent(self.ready.raw())?;
+        let prev = self.last_any_ready.swap(any_ready, Ordering::AcqRel);
+        if any_ready != prev {
+            unsafe {
+                if any_ready {
+                    self.status.stage(10);
+                    SetEvent(self.ready.raw())?;
+                } else {
+                    ResetEvent(self.ready.raw())?;
+                }
             }
         }
         Ok(())
@@ -328,61 +439,103 @@ impl Session {
         &self,
         relation: Relation,
         handle: u64,
-        kind: String,
-        name: String,
+        role: ElementRole,
         mutation: i32,
     ) -> Result<()> {
         if !self.active.load(Ordering::Acquire) {
             return Ok(());
         }
-        let Some((thread, dispatcher)) = self.owner_dispatcher()? else {
-            return Ok(());
-        };
-        if !dispatcher.has_thread_access()? {
-            return Err(Error::from(RPC_E_WRONG_THREAD));
-        }
-        let this = self;
-        let action = || {
-            if !this.active.load(Ordering::Acquire) {
+        let thread = unsafe { GetCurrentThreadId() };
+        // Every TREE borrow is short-lived and dropped strictly before any COM call or IUIElement drop.
+        let already_registered = TREE.with(|tree| -> Result<bool> {
+            let mut state = tree
+                .try_borrow_mut()
+                .map_err(|_| Error::from(E_UNEXPECTED))?;
+            state.prepare(self.epoch)?;
+            Ok(state.owner_registered)
+        })?;
+        if !already_registered {
+            let Some((_, dispatcher)) = self.owner_dispatcher()? else {
+                return Ok(());
+            };
+            if !dispatcher.has_thread_access()? {
+                return Err(Error::from(RPC_E_WRONG_THREAD));
+            }
+            if !self.active.load(Ordering::Acquire) {
                 return Ok(());
             }
-            let diagnostics = this.diagnostics.resolve()?;
             TREE.with(|tree| -> Result<()> {
-                tree.borrow_mut().prepare(this.epoch)?;
-                if mutation != 0 {
-                    let saved = tree.borrow().saved.get(&handle).cloned();
-                    if let Some((element, opacity)) = saved {
-                        unsafe {
-                            (element.vtable().SetOpacity)(element.as_raw(), opacity).ok()?;
-                        }
-                        tree.borrow_mut().saved.remove(&handle);
-                    }
-                    {
-                        let mut state = tree.borrow_mut();
-                        state.nodes.remove(&handle);
-                        state.frames.remove(&handle);
-                        state.targets.remove(&handle);
-                        state.pending.remove(&handle);
-                    }
-                } else {
-                    let mut state = tree.borrow_mut();
-                    state.nodes.insert(handle, relation.parent);
-                    if kind == "Taskbar.TaskbarFrame" {
-                        if state.frames.insert(handle) {
-                            this.status.data().frames.fetch_add(1, Ordering::Relaxed);
-                        }
-                        this.status.stage(8);
-                    }
-                    if kind == "Windows.UI.Xaml.Shapes.Rectangle"
-                        && matches!(name.as_str(), "BackgroundFill" | "BackgroundStroke")
-                    {
-                        state.pending.insert(handle, name == "BackgroundFill");
-                        if name == "BackgroundFill" {
-                            this.status.stage(9);
-                        }
-                    }
+                let mut state = tree
+                    .try_borrow_mut()
+                    .map_err(|_| Error::from(E_UNEXPECTED))?;
+                state.owner_registered = true;
+                Ok(())
+            })?;
+        }
+
+        if mutation != 0 {
+            let removed: Option<(IUIElement, f64)> = TREE.with(|tree| -> Result<_> {
+                let mut state = tree
+                    .try_borrow_mut()
+                    .map_err(|_| Error::from(E_UNEXPECTED))?;
+                let saved = state.saved.remove(&handle);
+                state.nodes.remove(&handle);
+                state.frames.remove(&handle);
+                state.targets.remove(&handle);
+                state.pending.remove(&handle);
+                Ok(saved)
+            })?;
+            if let Some((element, opacity)) = removed {
+                let set_res =
+                    unsafe { (element.vtable().SetOpacity)(element.as_raw(), opacity).ok() };
+                if let Err(error) = set_res {
+                    let displaced = TREE.with(|tree| {
+                        tree.try_borrow_mut()
+                            .ok()
+                            .and_then(|mut s| s.saved.insert(handle, (element, opacity)))
+                    });
+                    drop(displaced);
+                    return Err(error);
                 }
-                let candidates = tree.borrow().candidates();
+                // `element` drops here with zero RefCell borrows held.
+                drop(element);
+            }
+        } else {
+            let candidates = TREE.with(|tree| -> Result<Vec<(u64, u64, bool)>> {
+                let mut state = tree
+                    .try_borrow_mut()
+                    .map_err(|_| Error::from(E_UNEXPECTED))?;
+                state.nodes.insert(handle, relation.parent);
+                match role {
+                    ElementRole::TaskbarFrame => {
+                        if state.frames.insert(handle) {
+                            self.status.data().frames.fetch_add(1, Ordering::Relaxed);
+                            self.log(format!(
+                                "Bridge.Target handle={handle} parent={} thread={thread} type=Taskbar.TaskbarFrame",
+                                relation.parent
+                            ));
+                        }
+                        self.status.stage(8);
+                    }
+                    ElementRole::BackgroundFill => {
+                        state.pending.insert(handle, true);
+                        self.status.stage(9);
+                    }
+                    ElementRole::BackgroundStroke => {
+                        state.pending.insert(handle, false);
+                    }
+                    ElementRole::Other => {}
+                }
+                if state.pending.is_empty() || state.frames.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let found = state.candidates();
+                state.prune_non_frame_pending();
+                Ok(found)
+            })?;
+
+            if !candidates.is_empty() {
+                let diagnostics = self.diagnostics.resolve()?;
                 for (target, frame, fill) in candidates {
                     let mut raw = std::ptr::null_mut();
                     unsafe {
@@ -398,15 +551,27 @@ impl Session {
                     let mut opacity = 0.0;
                     unsafe {
                         (element.vtable().GetOpacity)(element.as_raw(), &mut opacity).ok()?;
-                        if !this.inspect {
-                            if !this.begin_change(thread)? {
+                        if !self.inspect {
+                            if !self.begin_change(thread)? {
                                 return Ok(());
                             }
-                            // Keep the original before mutation; readback can fail after Windows accepts the setter.
-                            tree.borrow_mut()
-                                .saved
-                                .entry(target)
-                                .or_insert_with(|| (element.clone(), opacity));
+                            // Clone COM interface OUTSIDE any RefCell borrow.
+                            let backup = element.clone();
+                            let unused_backup: Option<IUIElement> =
+                                TREE.with(|tree| -> Result<_> {
+                                    let mut state = tree
+                                        .try_borrow_mut()
+                                        .map_err(|_| Error::from(E_UNEXPECTED))?;
+                                    if let std::collections::hash_map::Entry::Vacant(slot) =
+                                        state.saved.entry(target)
+                                    {
+                                        slot.insert((backup, opacity));
+                                        Ok(None)
+                                    } else {
+                                        Ok(Some(backup))
+                                    }
+                                })?;
+                            drop(unused_backup);
                             (element.vtable().SetOpacity)(element.as_raw(), 0.0).ok()?;
                             let mut actual = f64::NAN;
                             (element.vtable().GetOpacity)(element.as_raw(), &mut actual).ok()?;
@@ -418,20 +583,49 @@ impl Session {
                             }
                         }
                     }
-                    let mut state = tree.borrow_mut();
-                    state.targets.insert(target, (frame, fill));
+                    TREE.with(|tree| -> Result<()> {
+                        let mut state = tree
+                            .try_borrow_mut()
+                            .map_err(|_| Error::from(E_UNEXPECTED))?;
+                        state.targets.insert(target, (frame, fill));
+                        state.pending.remove(&target);
+                        Ok(())
+                    })?;
+                    self.log(format!(
+                        "Bridge.Target handle={target} frame={frame} thread={thread} role={}",
+                        if fill {
+                            "BackgroundFill"
+                        } else {
+                            "BackgroundStroke"
+                        }
+                    ));
                     if fill {
-                        this.status.data().fills.fetch_add(1, Ordering::Relaxed);
+                        self.status.data().fills.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        this.status.data().borders.fetch_add(1, Ordering::Relaxed);
+                        self.status.data().borders.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                let state = tree.borrow();
-                this.update_ready(thread, state.has_background(), !state.saved.is_empty())?;
-                Ok(())
-            })
-        };
-        action()
+            }
+        }
+
+        let ready_change = TREE.with(|tree| -> Result<Option<(bool, bool)>> {
+            let mut state = tree
+                .try_borrow_mut()
+                .map_err(|_| Error::from(E_UNEXPECTED))?;
+            let has_background = state.has_background();
+            let has_saved = !state.saved.is_empty();
+            if has_background != state.last_ready || has_saved != state.last_dirty {
+                state.last_ready = has_background;
+                state.last_dirty = has_saved;
+                Ok(Some((has_background, has_saved)))
+            } else {
+                Ok(None)
+            }
+        })?;
+        if let Some((has_background, has_saved)) = ready_change {
+            self.update_ready(thread, has_background, has_saved)?;
+        }
+        Ok(())
     }
 
     fn restore(&self, subscription_removed: bool) -> Result<()> {
@@ -462,11 +656,16 @@ impl Session {
             let remaining = completion.clone();
             let owner = dispatcher.clone();
             let action = move || {
-                let result = (|| -> Result<()> {
+                let guarded = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
                     if unsafe { GetCurrentThreadId() } != thread || !owner.has_thread_access()? {
                         return Err(Error::from(RPC_E_WRONG_THREAD));
                     }
-                    let saved = TREE.with(|tree| std::mem::take(&mut tree.borrow_mut().saved));
+                    let saved = TREE.with(|tree| -> Result<_> {
+                        let mut state = tree
+                            .try_borrow_mut()
+                            .map_err(|_| Error::from(E_UNEXPECTED))?;
+                        Ok(std::mem::take(&mut state.saved))
+                    })?;
                     let mut failed = HashMap::new();
                     let mut failure = None;
                     for (handle, (element, opacity)) in saved {
@@ -477,18 +676,31 @@ impl Session {
                             failed.insert(handle, (element, opacity));
                         }
                     }
-                    TREE.with(|tree| {
+                    // Extract old TreeState / saved map out of RefCell before dropping any COM objects.
+                    let extracted_for_drop: Option<TreeState> = TREE.with(|tree| {
+                        let Ok(mut state) = tree.try_borrow_mut() else {
+                            return None;
+                        };
                         if failed.is_empty() {
-                            *tree.borrow_mut() = TreeState::default();
+                            Some(std::mem::take(&mut *state))
                         } else {
-                            tree.borrow_mut().saved = failed;
+                            let old_saved = std::mem::replace(&mut state.saved, failed);
+                            Some(TreeState {
+                                saved: old_saved,
+                                ..TreeState::default()
+                            })
                         }
                     });
+                    drop(extracted_for_drop);
                     if let Some(error) = failure {
                         return Err(error);
                     }
                     Ok(())
-                })();
+                }));
+                let result = match guarded {
+                    Ok(res) => res,
+                    Err(_) => Err(Error::from(E_FAIL)),
+                };
                 if let Err(error) = &result {
                     session.status.fail(error.code());
                     unsafe {
@@ -499,7 +711,7 @@ impl Session {
                     SESSION_ACTIVE.store(false, Ordering::Release);
                     session.status.stage(12);
                     unsafe {
-                        SetEvent(session.done.raw())?;
+                        let _ = SetEvent(session.done.raw());
                     }
                 }
                 result
@@ -522,7 +734,7 @@ struct Watcher {
 }
 impl ITreeCallback2_Impl for Watcher_Impl {
     unsafe fn OnElementStateChanged(&self, _: u64, _: i32, _: PCWSTR) -> HRESULT {
-        S_OK
+        catch_unwind(AssertUnwindSafe(|| S_OK)).unwrap_or(E_FAIL)
     }
 }
 
@@ -533,41 +745,48 @@ impl ITreeCallback_Impl for Watcher_Impl {
         element: VisualElement,
         mutation: i32,
     ) -> HRESULT {
-        // XAML diagnostics transfers these four BSTRs to the callback, including inactive callbacks.
-        let _file = BSTR::from_raw(element.source.file);
-        let _hash = BSTR::from_raw(element.source.hash);
-        let kind_text = BSTR::from_raw(element.kind);
-        let name_text = BSTR::from_raw(element.name);
-        if !self.session.active.load(Ordering::Acquire) {
-            return S_OK;
-        }
-        self.session
-            .status
-            .data()
-            .callbacks
-            .fetch_add(1, Ordering::Relaxed);
-        self.session.status.stage(7);
-        if !self.session.seen.swap(true, Ordering::AcqRel) {
-            protocol::trace("Bridge.Callback received");
-        }
-        let kind = kind_text.to_string();
-        let name = name_text.to_string();
-        if kind == "Taskbar.TaskbarFrame"
-            || matches!(name.as_str(), "BackgroundFill" | "BackgroundStroke")
-        {
-            protocol::trace(&format!(
-                "Bridge.Target handle={} parent={} thread={} type={kind} name={name} mutation={mutation}",
-                element.handle, relation.parent, GetCurrentThreadId()
-            ));
-        }
-        let result = self
-            .session
-            .mutation(relation, element.handle, kind, name, mutation);
-        if let Err(error) = &result {
-            self.session.status.fail(error.code());
+        catch_unwind(AssertUnwindSafe(|| {
+            // XAML diagnostics transfers these four BSTRs to the callback, including inactive callbacks.
+            let _file = BSTR::from_raw(element.source.file);
+            let _hash = BSTR::from_raw(element.source.hash);
+            let kind_text = BSTR::from_raw(element.kind);
+            let name_text = BSTR::from_raw(element.name);
+            if !self.session.active.load(Ordering::Acquire) {
+                return S_OK;
+            }
+            self.session
+                .status
+                .data()
+                .callbacks
+                .fetch_add(1, Ordering::Relaxed);
+            self.session.status.stage(7);
+            if !self.session.seen.swap(true, Ordering::AcqRel) {
+                self.session.log("Bridge.Callback received");
+            }
+            // Zero-copy UTF-16 matching avoids two heap String allocations per XAML callback.
+            let role = classify_element(kind_text.as_wide(), name_text.as_wide());
+            if self.session.inspect && role != ElementRole::Other {
+                self.session.log(format!(
+                    "Bridge.Diagnose handle={} parent={} thread={} role={role:?} mutation={mutation}",
+                    element.handle,
+                    relation.parent,
+                    GetCurrentThreadId()
+                ));
+            }
+            let result = self
+                .session
+                .mutation(relation, element.handle, role, mutation);
+            if let Err(error) = &result {
+                self.session.status.fail(error.code());
+                let _ = SetEvent(self.session.failed.raw());
+            }
+            result.into()
+        }))
+        .unwrap_or_else(|_| {
+            self.session.status.fail(E_FAIL);
             let _ = SetEvent(self.session.failed.raw());
-        }
-        result.into()
+            E_FAIL
+        })
     }
 }
 
@@ -577,14 +796,55 @@ struct Site {
 }
 impl IObjectWithSite_Impl for Site_Impl {
     fn SetSite(&self, site: Option<&IUnknown>) -> Result<()> {
-        protocol::trace("Bridge.SetSite");
+        match catch_unwind(AssertUnwindSafe(|| self.set_site_inner(site))) {
+            Ok(res) => res,
+            Err(_) => {
+                SESSION_ACTIVE.store(false, Ordering::Release);
+                Err(Error::from(E_FAIL))
+            }
+        }
+    }
+
+    fn GetSite(&self, iid: *const GUID, out: *mut *mut c_void) -> Result<()> {
+        match catch_unwind(AssertUnwindSafe(|| {
+            if iid.is_null() || out.is_null() {
+                return Err(Error::from(E_POINTER));
+            }
+            unsafe {
+                *out = std::ptr::null_mut();
+            }
+            let site = self.site.lock().map_err(|_| Error::from(E_UNEXPECTED))?;
+            let site = site.as_ref().ok_or_else(|| Error::from(E_FAIL))?;
+            unsafe { site.query(iid, out).ok() }
+        })) {
+            Ok(res) => res,
+            Err(_) => Err(Error::from(E_FAIL)),
+        }
+    }
+}
+
+impl Site_Impl {
+    fn set_site_inner(&self, site: Option<&IUnknown>) -> Result<()> {
         let Some(site) = site else {
             *self.site.lock().map_err(|_| Error::from(E_UNEXPECTED))? = None;
             return Ok(());
         };
-        let status = Arc::new(protocol::StatusChannel::open(unsafe {
-            GetCurrentProcessId()
-        })?);
+        let diagnostics: IXamlDiagnostics = site.cast()?;
+        let mut init_raw = std::ptr::null_mut();
+        unsafe {
+            diagnostics.GetInitializationData(&mut init_raw).ok()?;
+        }
+        if init_raw.is_null() {
+            return Err(Error::from(E_INVALIDARG));
+        }
+        let init_bstr = unsafe { BSTR::from_raw(init_raw) };
+        let init = protocol::parse_init_data(&init_bstr.to_string())?;
+        let current_pid = unsafe { GetCurrentProcessId() };
+        if init.shell != current_pid {
+            return Err(Error::from(E_INVALIDARG));
+        }
+
+        let status = Arc::new(protocol::StatusChannel::open(&init.token, current_pid)?);
         status.stage(2);
         if SESSION_ACTIVE.swap(true, Ordering::AcqRel) {
             status.fail(E_ILLEGAL_METHOD_CALL);
@@ -592,28 +852,27 @@ impl IObjectWithSite_Impl for Site_Impl {
         }
         let result = (|| -> Result<()> {
             status.stage(3);
-            protocol::trace("Bridge.QueryDiagnostics");
-            let diagnostics: IXamlDiagnostics = site.cast()?;
-            protocol::trace("Bridge.QueryTree");
             let tree: ITreeService = site.cast()?;
             let mut raw = std::ptr::null_mut();
             unsafe {
-                protocol::trace("Bridge.GetDispatcher");
                 diagnostics.GetDispatcher(&mut raw).ok()?;
             }
             if raw.is_null() {
                 return Err(Error::from(E_POINTER));
             }
             status.stage(4);
-            protocol::trace("Bridge.ResolveDispatcher");
             let dispatcher = UiDispatcher::from_object(&unsafe { IUnknown::from_raw(raw) })?;
             status.stage(5);
             let (host, shell, generation, inspect) = status.initialization()?;
-            if shell != unsafe { GetCurrentProcessId() } {
+            if host != init.host
+                || shell != current_pid
+                || generation != init.generation
+                || inspect != init.inspect
+            {
                 return Err(Error::from(E_INVALIDARG));
             }
             let open_event = |kind: &str, access| -> Result<Arc<OwnedHandle>> {
-                let name = protocol::event_name(host, shell, generation, kind);
+                let name = protocol::event_name(&init.token, kind);
                 unsafe {
                     OpenEventW(access, false, PCWSTR(name.as_ptr()))
                         .map(|handle| Arc::new(OwnedHandle(handle.0 as usize)))
@@ -626,6 +885,7 @@ impl IObjectWithSite_Impl for Site_Impl {
             let process = Arc::new(OwnedHandle(
                 unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, host)? }.0 as usize,
             ));
+            let (log_tx, log_rx) = mpsc::sync_channel::<String>(64);
             let session = Session {
                 epoch: SESSION_EPOCH.fetch_add(1, Ordering::AcqRel) + 1,
                 diagnostics: AgileReference::new(&diagnostics)?,
@@ -633,12 +893,14 @@ impl IObjectWithSite_Impl for Site_Impl {
                 owners: Arc::new(Mutex::new(HashMap::new())),
                 restoring: Arc::new(AtomicBool::new(false)),
                 active: Arc::new(AtomicBool::new(true)),
+                last_any_ready: Arc::new(AtomicBool::new(false)),
                 inspect,
                 status: status.clone(),
                 seen: Arc::new(AtomicBool::new(false)),
                 ready,
                 failed,
                 done,
+                log_tx,
             };
             let callback: ITreeCallback2 = Watcher {
                 session: session.clone(),
@@ -649,52 +911,90 @@ impl IObjectWithSite_Impl for Site_Impl {
             let callback = AgileReference::new(&callback)?;
             std::thread::Builder::new()
                 .name("taskbar-watch".into())
+                .stack_size(256 * 1024)
                 .spawn(move || {
-                    unsafe {
-                        if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
-                            let _ = SetEvent(session.failed.raw());
-                            SESSION_ACTIVE.store(false, Ordering::Release);
-                            return;
-                        }
-                        let mut subscription_removed = true;
-                        let result = (|| -> Result<()> {
-                            let tree = tree.resolve()?;
-                            let callback = callback.resolve()?;
-                            session.status.stage(6);
-                            protocol::trace("Bridge.Advise");
-                            subscription_removed = false;
-                            // Advise can register before failing during initial enumeration.
-                            let operation = (|| -> Result<()> {
-                                tree.AdviseVisualTreeChange(callback.as_raw()).ok()?;
-                                protocol::trace("Bridge.Advised");
-                                if WaitForMultipleObjects(
-                                    &[process.raw(), stop.raw()],
-                                    false,
-                                    INFINITE,
-                                ) == WAIT_FAILED
-                                {
-                                    return Err(Error::from_win32());
+                    let failed_handle = session.failed.clone();
+                    let status_ref = session.status.clone();
+                    let outer = catch_unwind(AssertUnwindSafe(move || {
+                        let _com = match ComGuard::init_mta() {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                status_ref.fail(error.code());
+                                unsafe {
+                                    let _ = SetEvent(failed_handle.raw());
                                 }
-                                Ok(())
-                            })();
-                            session.active.store(false, Ordering::Release);
-                            let removal = tree.UnadviseVisualTreeChange(callback.as_raw()).ok();
-                            subscription_removed = removal.is_ok();
-                            if let Err(error) = &removal {
-                                session.status.fail(error.code());
+                                SESSION_ACTIVE.store(false, Ordering::Release);
+                                return;
                             }
-                            operation.and(removal)
-                        })();
-                        if let Err(error) = &result {
-                            session.status.fail(error.code());
-                            let _ = SetEvent(session.failed.raw());
+                        };
+                        // Move ALL COM-holding objects (`tree`, `callback`, `session`) into an inner
+                        // scope/closure so they are guaranteed to drop strictly BEFORE `_com` calls
+                        // `CoUninitialize()`, even if an unexpected panic unwinds.
+                        let worker_failed = session.failed.clone();
+                        let worker_status = session.status.clone();
+                        let inner = catch_unwind(AssertUnwindSafe(move || {
+                            let mut subscription_removed = true;
+                            let result = (|| -> Result<()> {
+                                let tree = tree.resolve()?;
+                                let callback = callback.resolve()?;
+                                session.status.stage(6);
+                                protocol::trace("Bridge.Advise");
+                                subscription_removed = false;
+                                // Advise can register before failing during initial enumeration.
+                                let operation = (|| -> Result<()> {
+                                    unsafe {
+                                        tree.AdviseVisualTreeChange(callback.as_raw()).ok()?;
+                                    }
+                                    protocol::trace("Bridge.Advised");
+                                    flush_logs(&log_rx);
+                                    unsafe {
+                                        if WaitForMultipleObjects(
+                                            &[process.raw(), stop.raw()],
+                                            false,
+                                            INFINITE,
+                                        ) == WAIT_FAILED
+                                        {
+                                            return Err(Error::from_win32());
+                                        }
+                                    }
+                                    Ok(())
+                                })();
+                                session.active.store(false, Ordering::Release);
+                                let removal = unsafe {
+                                    tree.UnadviseVisualTreeChange(callback.as_raw()).ok()
+                                };
+                                subscription_removed = removal.is_ok();
+                                if let Err(error) = &removal {
+                                    session.status.fail(error.code());
+                                }
+                                operation.and(removal)
+                            })();
+                            if let Err(error) = &result {
+                                session.status.fail(error.code());
+                                unsafe {
+                                    let _ = SetEvent(session.failed.raw());
+                                }
+                            }
+                            if let Err(error) = session.restore(subscription_removed) {
+                                session.status.fail(error.code());
+                                unsafe {
+                                    let _ = SetEvent(session.failed.raw());
+                                }
+                            }
+                            flush_logs(&log_rx);
+                            // `tree`, `callback`, `session`, `process`, `stop` drop at the end of this closure,
+                            // BEFORE `_com` runs `CoUninitialize()`.
+                        }));
+                        if inner.is_err() {
+                            worker_status.fail(E_FAIL);
+                            unsafe {
+                                let _ = SetEvent(worker_failed.raw());
+                            }
+                            SESSION_ACTIVE.store(false, Ordering::Release);
                         }
-                        if let Err(error) = session.restore(subscription_removed) {
-                            session.status.fail(error.code());
-                            let _ = SetEvent(session.failed.raw());
-                        }
-                        // Callback and queued UI closures own event handles until their last reference ends.
-                        CoUninitialize();
+                    }));
+                    if outer.is_err() {
+                        SESSION_ACTIVE.store(false, Ordering::Release);
                     }
                 })
                 .map_err(|error| Error::new(E_FAIL, error.to_string()))?;
@@ -703,21 +1003,9 @@ impl IObjectWithSite_Impl for Site_Impl {
         })();
         if let Err(error) = &result {
             status.fail(error.code());
-            protocol::trace(&format!("Bridge.SetSite error={error}"));
             SESSION_ACTIVE.store(false, Ordering::Release);
         }
         result
-    }
-    fn GetSite(&self, iid: *const GUID, out: *mut *mut c_void) -> Result<()> {
-        if iid.is_null() || out.is_null() {
-            return Err(Error::from(E_POINTER));
-        }
-        unsafe {
-            *out = std::ptr::null_mut();
-        }
-        let site = self.site.lock().map_err(|_| Error::from(E_UNEXPECTED))?;
-        let site = site.as_ref().ok_or_else(|| Error::from(E_FAIL))?;
-        unsafe { site.query(iid, out).ok() }
     }
 }
 
@@ -730,24 +1018,40 @@ impl IClassFactory_Impl for Factory_Impl {
         iid: *const GUID,
         out: *mut *mut c_void,
     ) -> Result<()> {
-        if iid.is_null() || out.is_null() {
-            return Err(Error::from(E_POINTER));
+        match catch_unwind(AssertUnwindSafe(|| {
+            if iid.is_null() || out.is_null() {
+                return Err(Error::from(E_POINTER));
+            }
+            unsafe {
+                *out = std::ptr::null_mut();
+            }
+            if outer.is_some() {
+                return Err(Error::from(CLASS_E_NOAGGREGATION));
+            }
+            let site: IObjectWithSite = Site {
+                site: Mutex::new(None),
+            }
+            .into();
+            unsafe { site.query(iid, out).ok() }
+        })) {
+            Ok(res) => res,
+            Err(_) => Err(Error::from(E_FAIL)),
         }
-        unsafe {
-            *out = std::ptr::null_mut();
-        }
-        if outer.is_some() {
-            return Err(Error::from(CLASS_E_NOAGGREGATION));
-        }
-        let site: IObjectWithSite = Site {
-            site: Mutex::new(None),
-        }
-        .into();
-        unsafe { site.query(iid, out).ok() }
     }
     fn LockServer(&self, _: BOOL) -> Result<()> {
         Ok(())
     }
+}
+
+/// # Safety
+/// Called by the OS loader under the loader lock; must never unwind or invoke COM/blocking APIs.
+#[no_mangle]
+pub unsafe extern "system" fn DllMain(
+    _instance: HMODULE,
+    _reason: u32,
+    _reserved: *mut c_void,
+) -> BOOL {
+    catch_unwind(AssertUnwindSafe(|| TRUE)).unwrap_or(FALSE)
 }
 
 /// # Safety
@@ -758,31 +1062,29 @@ pub unsafe extern "system" fn DllGetClassObject(
     iid: *const GUID,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    if class.is_null() || iid.is_null() || out.is_null() {
-        return E_POINTER;
-    }
-    *out = std::ptr::null_mut();
-    if *class != protocol::BRIDGE_CLSID {
-        return CLASS_E_CLASSNOTAVAILABLE;
-    }
-    protocol::trace("Bridge.DllGetClassObject");
-    let status = match protocol::StatusChannel::open(GetCurrentProcessId()) {
-        Ok(status) => Arc::new(status),
-        Err(error) => return error.code(),
-    };
-    status.stage(1);
-    let factory: IClassFactory = Factory.into();
-    factory.query(iid, out)
+    catch_unwind(AssertUnwindSafe(|| {
+        if class.is_null() || iid.is_null() || out.is_null() {
+            return E_POINTER;
+        }
+        *out = std::ptr::null_mut();
+        if *class != protocol::BRIDGE_CLSID {
+            return CLASS_E_CLASSNOTAVAILABLE;
+        }
+        let factory: IClassFactory = Factory.into();
+        factory.query(iid, out)
+    }))
+    .unwrap_or(E_FAIL)
 }
 
 #[no_mangle]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
-    S_FALSE
+    catch_unwind(|| S_FALSE).unwrap_or(S_FALSE)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn new_session_clears_clean_thread_cache() {
         let mut tree = TreeState::default();
@@ -873,7 +1175,84 @@ mod tests {
             std::mem::offset_of!(IXamlDiagnostics_Vtbl, GetIInspectableFromHandle),
             6 * 8
         );
+        assert_eq!(
+            std::mem::offset_of!(IXamlDiagnostics_Vtbl, GetInitializationData),
+            10 * 8
+        );
         assert_eq!(std::mem::offset_of!(IUIElement_Vtbl, GetOpacity), 9 * 8);
         assert_eq!(std::mem::offset_of!(IUIElement_Vtbl, SetOpacity), 10 * 8);
+    }
+
+    #[test]
+    fn com_guard_drops_after_inner_objects_even_on_unwind() {
+        let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        struct Tracker(Arc<Mutex<Vec<&'static str>>>, &'static str);
+        impl Drop for Tracker {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push(self.1);
+            }
+        }
+        let guard = Tracker(events.clone(), "com_uninit");
+        let com_obj = Tracker(events.clone(), "com_object");
+        let res = catch_unwind(AssertUnwindSafe(move || {
+            let _obj = com_obj;
+            panic!("simulated failure");
+        }));
+        assert!(res.is_err());
+        drop(guard);
+        assert_eq!(*events.lock().unwrap(), vec!["com_object", "com_uninit"]);
+    }
+
+    #[test]
+    fn classify_element_matches_utf16_without_allocation() {
+        let to_u16 = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+        assert_eq!(
+            classify_element(&to_u16("Taskbar.TaskbarFrame"), &[]),
+            ElementRole::TaskbarFrame
+        );
+        assert_eq!(
+            classify_element(
+                &to_u16("Windows.UI.Xaml.Shapes.Rectangle"),
+                &to_u16("BackgroundFill")
+            ),
+            ElementRole::BackgroundFill
+        );
+        assert_eq!(
+            classify_element(
+                &to_u16("Windows.UI.Xaml.Shapes.Rectangle"),
+                &to_u16("BackgroundStroke")
+            ),
+            ElementRole::BackgroundStroke
+        );
+        assert_eq!(
+            classify_element(
+                &to_u16("Windows.UI.Xaml.Controls.Grid"),
+                &to_u16("BackgroundFill")
+            ),
+            ElementRole::Other
+        );
+    }
+
+    #[test]
+    fn prune_non_frame_pending_drops_root_controls_and_keeps_unresolved_parents() {
+        let mut tree = TreeState::default();
+        tree.frames.insert(10);
+        tree.nodes.insert(10, 0);
+        // Non-taskbar tooltip control connected all the way to root 0.
+        tree.nodes.insert(200, 0);
+        tree.nodes.insert(201, 200);
+        tree.pending.insert(201, true);
+        // Unresolved late child whose parent 50 has not arrived yet.
+        tree.nodes.insert(51, 50);
+        tree.pending.insert(51, true);
+        // Already-applied target still in pending gets pruned too.
+        tree.nodes.insert(11, 10);
+        tree.targets.insert(11, (10, true));
+        tree.pending.insert(11, true);
+
+        tree.prune_non_frame_pending();
+        assert!(!tree.pending.contains_key(&201));
+        assert!(!tree.pending.contains_key(&11));
+        assert!(tree.pending.contains_key(&51));
     }
 }

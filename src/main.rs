@@ -3,14 +3,37 @@
 use std::{
     ffi::c_void,
     os::windows::ffi::OsStrExt,
-    path::Path,
-    sync::atomic::{AtomicU32, Ordering},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    time::{Duration, Instant},
 };
 use windows::{
-    core::{s, w, Error, Result, PCSTR, PCWSTR},
+    core::{s, w, Error, Result, PCSTR, PCWSTR, PWSTR},
     Win32::{
         Foundation::*,
-        System::{Com::*, LibraryLoader::*, Registry::*, RemoteDesktop::*, Threading::*},
+        Security::{
+            Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+            EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        },
+        Storage::FileSystem::{
+            CreateFileW, GetDriveTypeW, GetFileInformationByHandle, GetFileVersionInfoSizeW,
+            GetFileVersionInfoW, GetFinalPathNameByHandleW, VerQueryValueW,
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            READ_CONTROL, VOLUME_NAME_DOS,
+        },
+        System::{
+            Com::*,
+            LibraryLoader::*,
+            Memory::{SetProcessWorkingSetSizeEx, SETPROCESSWORKINGSETSIZEEX_FLAGS},
+            Registry::*,
+            RemoteDesktop::*,
+            SystemInformation::GetWindowsDirectoryW,
+            SystemServices::*,
+            Threading::*,
+            WindowsProgramming::DRIVE_REMOTE,
+        },
         UI::{Accessibility::*, Shell::*, WindowsAndMessaging::*},
     },
 };
@@ -24,16 +47,15 @@ const SETTINGS_KEY: PCWSTR = w!(r"Software\TransparentBar");
 const CONNECTOR_VALUE: PCWSTR = w!("TaskbarConnector");
 const PATTERN_VALUE: PCWSTR = w!("TaskbarPattern");
 const REDUCE_MOTION_VALUE: PCWSTR = w!("ReduceMotion");
+const AUTO_UPDATE_VALUE: PCWSTR = w!("CheckUpdatesAtStartup");
 const TRAY_MESSAGE: u32 = WM_APP + 1;
-const RECONNECT_MESSAGE: u32 = WM_APP + 2;
-const REFRESH_MESSAGE: u32 = WM_APP + 3;
-const COMMAND_MESSAGE: u32 = WM_APP + 5;
 const MENU_MESSAGE: u32 = WM_APP + 4;
 const UPDATE_MESSAGE: u32 = WM_APP + 6;
 const POWER_PAUSE_MESSAGE: u32 = WM_APP + 7;
 const POWER_RESUME_MESSAGE: u32 = WM_APP + 8;
 const CONNECTOR_FAST_MS: u32 = 16;
 const CONNECTOR_SETTLED_MS: u32 = 64;
+const CONNECTOR_QUIESCENT_MS: u32 = 250;
 const STARTUP: usize = 1;
 const ABOUT: usize = 2;
 const EXIT: usize = 3;
@@ -43,18 +65,377 @@ const PATTERN: usize = 6;
 const REDUCE_MOTION: usize = 7;
 const SUPPORT: usize = 8;
 const SAWERIA: usize = 9;
+const AUTO_UPDATE: usize = 10;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const REFRESH_TIMER_ID: usize = 1;
 const CONNECTOR_TIMER_ID: usize = 2;
 const CONNECTOR_IDLE_MS: u32 = 1000;
+const RECONNECT_COOLDOWN: Duration = Duration::from_secs(3);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+static MAIN_HWND: AtomicUsize = AtomicUsize::new(0);
+static CONNECTOR_ENABLED: AtomicBool = AtomicBool::new(false);
+static CONNECTOR_VISIBLE: AtomicBool = AtomicBool::new(false);
+static PAUSED: AtomicBool = AtomicBool::new(false);
+static NEEDS_LEGACY_REFRESH: AtomicBool = AtomicBool::new(true);
+static CONNECTOR_TIMER_MS: AtomicU32 = AtomicU32::new(0);
 
 mod connector;
 mod icon;
 mod protocol;
 mod updater;
-use protocol::{event_name, InitializeXaml, StatusChannel, BRIDGE_CLSID, BRIDGE_FILE};
-static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+use protocol::{
+    event_name, format_init_data, generate_session_token, InitializeXaml, OwnerSecurityAttributes,
+    StatusChannel, BRIDGE_CLSID, BRIDGE_FILE,
+};
+static RESTART: AtomicBool = AtomicBool::new(false);
+
+struct OwnedHandle(HANDLE);
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+struct OwnedSd(PSECURITY_DESCRIPTOR);
+impl Drop for OwnedSd {
+    fn drop(&mut self) {
+        if !self.0 .0.is_null() {
+            unsafe {
+                let _ = LocalFree(HLOCAL(self.0 .0));
+            }
+        }
+    }
+}
+
+fn harden_process() {
+    unsafe {
+        let _ = SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+        let _ = SetDllDirectoryW(w!(""));
+
+        let mut ext_policy = PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY::default();
+        // Bit 0: DisableExtensionPoints = 1
+        ext_policy.Anonymous.Flags = 1;
+        let _ = SetProcessMitigationPolicy(
+            ProcessExtensionPointDisablePolicy,
+            (&ext_policy as *const PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY).cast(),
+            std::mem::size_of::<PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY>(),
+        );
+
+        let mut img_policy = PROCESS_MITIGATION_IMAGE_LOAD_POLICY::default();
+        // Bit 0: NoRemoteImages = 1, Bit 1: NoLowMandatoryLabelImages = 1
+        img_policy.Anonymous.Flags = 0b11;
+        let _ = SetProcessMitigationPolicy(
+            ProcessImageLoadPolicy,
+            (&img_policy as *const PROCESS_MITIGATION_IMAGE_LOAD_POLICY).cast(),
+            std::mem::size_of::<PROCESS_MITIGATION_IMAGE_LOAD_POLICY>(),
+        );
+    }
+}
+
+fn normalize_win32_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('\0');
+    let stripped = trimmed
+        .strip_prefix(r"\\?\")
+        .unwrap_or(trimmed)
+        .replace('/', "\\");
+    stripped.to_lowercase()
+}
+
+fn strip_extended_prefix(path: &str) -> PathBuf {
+    PathBuf::from(path.strip_prefix(r"\\?\").unwrap_or(path))
+}
+
+fn is_expected_explorer_path(actual: &str, windows_dir: &str) -> bool {
+    let base = normalize_win32_path(windows_dir);
+    let base = base.trim_end_matches('\\');
+    if base.is_empty() {
+        return false;
+    }
+    let expected = format!(r"{base}\explorer.exe");
+    normalize_win32_path(actual) == expected
+}
+
+fn verify_explorer_process(pid: u32) -> Result<()> {
+    if pid == 0 {
+        return Err(Error::from(E_ACCESSDENIED));
+    }
+    unsafe {
+        let process = OwnedHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)?);
+        let mut image_buf = vec![0u16; 1024];
+        let mut image_len = image_buf.len() as u32;
+        QueryFullProcessImageNameW(
+            process.0,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(image_buf.as_mut_ptr()),
+            &mut image_len,
+        )?;
+        let actual = String::from_utf16_lossy(&image_buf[..image_len as usize]);
+
+        let mut win_buf = [0u16; 512];
+        let win_len = GetWindowsDirectoryW(Some(&mut win_buf)) as usize;
+        if win_len == 0 || win_len >= win_buf.len() {
+            return Err(Error::from_win32());
+        }
+        let windows_dir = String::from_utf16_lossy(&win_buf[..win_len]);
+        if !is_expected_explorer_path(&actual, &windows_dir) {
+            return Err(Error::new(
+                E_ACCESSDENIED,
+                "Target taskbar window does not belong to Windows Explorer.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn final_path_by_handle(handle: HANDLE) -> Result<String> {
+    unsafe {
+        let mut buf = vec![0u16; 1024];
+        let len = GetFinalPathNameByHandleW(handle, &mut buf, VOLUME_NAME_DOS) as usize;
+        if len == 0 {
+            return Err(Error::from_win32());
+        }
+        if len >= buf.len() {
+            buf.resize(len + 1, 0);
+            let len = GetFinalPathNameByHandleW(handle, &mut buf, VOLUME_NAME_DOS) as usize;
+            if len == 0 || len >= buf.len() {
+                return Err(Error::from_win32());
+            }
+            return Ok(String::from_utf16_lossy(&buf[..len]));
+        }
+        Ok(String::from_utf16_lossy(&buf[..len]))
+    }
+}
+
+fn reject_remote_or_unc_path(canonical_path: &str) -> Result<()> {
+    let stripped = canonical_path
+        .strip_prefix(r"\\?\")
+        .unwrap_or(canonical_path);
+    if stripped.starts_with(r"\\") || stripped.to_ascii_uppercase().starts_with(r"UNC\") {
+        return Err(Error::new(
+            E_ACCESSDENIED,
+            "Bridge DLL cannot be loaded from a network or UNC location.",
+        ));
+    }
+    let bytes = stripped.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return Err(Error::new(
+            E_ACCESSDENIED,
+            "Bridge DLL must reside on a local drive.",
+        ));
+    }
+    let root: Vec<u16> = format!("{}:\\", bytes[0] as char)
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let drive_type = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+    if drive_type == DRIVE_REMOTE || drive_type <= 1 {
+        return Err(Error::new(
+            E_ACCESSDENIED,
+            "Bridge DLL cannot be loaded from a remote drive.",
+        ));
+    }
+    Ok(())
+}
+
+fn file_owner_sid(handle: HANDLE) -> Result<(OwnedSd, PSID)> {
+    unsafe {
+        let mut owner = PSID::default();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let err = GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut sd),
+        );
+        if err != ERROR_SUCCESS {
+            return Err(Error::from(err.to_hresult()));
+        }
+        let sd = OwnedSd(sd);
+        if owner.is_invalid() {
+            return Err(Error::from(E_ACCESSDENIED));
+        }
+        Ok((sd, owner))
+    }
+}
+
+#[cfg(target_env = "msvc")]
+fn query_version_string(block: &[u8], sub_block: PCWSTR) -> Option<String> {
+    unsafe {
+        let mut ptr = std::ptr::null_mut();
+        let mut len = 0u32;
+        if !VerQueryValueW(block.as_ptr().cast(), sub_block, &mut ptr, &mut len).as_bool()
+            || ptr.is_null()
+            || len == 0
+        {
+            return None;
+        }
+        let slice = std::slice::from_raw_parts(ptr.cast::<u16>(), len as usize);
+        let nul = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+        Some(String::from_utf16_lossy(&slice[..nul]))
+    }
+}
+
+#[cfg(target_env = "msvc")]
+fn verify_bridge_version_resource(path: &Path) -> Result<()> {
+    let path_wide = wide(path.as_os_str());
+    unsafe {
+        let mut handle = 0u32;
+        let size = GetFileVersionInfoSizeW(PCWSTR(path_wide.as_ptr()), Some(&mut handle));
+        if size == 0 {
+            return Err(Error::new(
+                E_ACCESSDENIED,
+                "Bridge DLL is missing required PE version metadata.",
+            ));
+        }
+        let mut block = vec![0u8; size as usize];
+        GetFileVersionInfoW(
+            PCWSTR(path_wide.as_ptr()),
+            handle,
+            size,
+            block.as_mut_ptr().cast(),
+        )?;
+        let product = query_version_string(&block, w!(r"\StringFileInfo\040904b0\ProductName"));
+        let internal = query_version_string(&block, w!(r"\StringFileInfo\040904b0\InternalName"));
+        let version = query_version_string(&block, w!(r"\StringFileInfo\040904b0\FileVersion"));
+        if product.as_deref() != Some("TransparentBar")
+            || internal.as_deref() != Some("transparentbar_bridge")
+            || version.as_deref() != Some(env!("CARGO_PKG_VERSION"))
+        {
+            return Err(Error::new(
+                E_ACCESSDENIED,
+                "Bridge DLL version stamp does not match this TransparentBar build.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_bridge_dll() -> Result<(PathBuf, OwnedHandle)> {
+    let exe_path = std::env::current_exe()?;
+    let exe_dir = exe_path
+        .parent()
+        .ok_or_else(|| Error::new(E_FAIL, "Could not resolve application directory."))?;
+    let exe_dir_wide = wide(exe_dir.as_os_str());
+    let dir_handle = OwnedHandle(unsafe {
+        CreateFileW(
+            PCWSTR(exe_dir_wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )?
+    });
+    let mut dir_info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(dir_handle.0, &mut dir_info)?;
+    }
+    if (dir_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0
+        || (dir_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) == 0
+    {
+        return Err(Error::new(
+            E_ACCESSDENIED,
+            "Application directory cannot be a symlink or reparse point.",
+        ));
+    }
+    let canonical_dir = final_path_by_handle(dir_handle.0)?;
+    reject_remote_or_unc_path(&canonical_dir)?;
+
+    let exe_wide = wide(exe_path.as_os_str());
+    let exe_handle = OwnedHandle(unsafe {
+        CreateFileW(
+            PCWSTR(exe_wide.as_ptr()),
+            READ_CONTROL.0,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )?
+    });
+    let (_exe_sd, exe_owner) = file_owner_sid(exe_handle.0)?;
+
+    let bridge_candidate = exe_dir.join(BRIDGE_FILE);
+    let bridge_wide = wide(bridge_candidate.as_os_str());
+    // Hold FILE_SHARE_READ only (no write/delete share) across verification and injection to eliminate TOCTOU.
+    let bridge_handle = OwnedHandle(unsafe {
+        CreateFileW(
+            PCWSTR(bridge_wide.as_ptr()),
+            FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        .map_err(|_| {
+            Error::new(
+                E_FAIL,
+                format!("{BRIDGE_FILE} must be in the application folder."),
+            )
+        })?
+    });
+
+    let mut bridge_info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(bridge_handle.0, &mut bridge_info)?;
+    }
+    if (bridge_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0
+        || (bridge_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0
+        || (bridge_info.nFileSizeHigh == 0 && bridge_info.nFileSizeLow == 0)
+    {
+        return Err(Error::new(
+            E_ACCESSDENIED,
+            "Bridge DLL is invalid or uses a disallowed reparse point.",
+        ));
+    }
+
+    let canonical_bridge = final_path_by_handle(bridge_handle.0)?;
+    reject_remote_or_unc_path(&canonical_bridge)?;
+    let bridge_clean = strip_extended_prefix(&canonical_bridge);
+    let dir_clean = strip_extended_prefix(&canonical_dir);
+    let same_dir = bridge_clean.parent().is_some_and(|parent| {
+        normalize_win32_path(&parent.to_string_lossy())
+            == normalize_win32_path(&dir_clean.to_string_lossy())
+    });
+    let same_name = bridge_clean
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case(BRIDGE_FILE));
+    if !same_dir || !same_name {
+        return Err(Error::new(
+            E_ACCESSDENIED,
+            "Bridge DLL resolved outside the application folder.",
+        ));
+    }
+
+    let (_bridge_sd, bridge_owner) = file_owner_sid(bridge_handle.0)?;
+    let token_buf = protocol::current_user_token_buffer()?;
+    let current_sid = protocol::token_user_sid(&token_buf)?;
+    let owner_ok = unsafe {
+        EqualSid(bridge_owner, current_sid).is_ok() || EqualSid(bridge_owner, exe_owner).is_ok()
+    };
+    if !owner_ok {
+        return Err(Error::new(
+            E_ACCESSDENIED,
+            "Bridge DLL owner does not match the current user or application binary.",
+        ));
+    }
+
+    #[cfg(target_env = "msvc")]
+    verify_bridge_version_resource(&bridge_clean)?;
+
+    Ok((bridge_clean, bridge_handle))
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -88,27 +469,29 @@ impl XamlSession {
             if shell == 0 {
                 return Err(Error::from(E_FAIL));
             }
+            verify_explorer_process(shell)?;
+
             let host = GetCurrentProcessId();
+            let inspect = std::env::args().any(|arg| arg == "--diagnose");
+            let token = generate_session_token()?;
+            let security = OwnerSecurityAttributes::current_user()?;
             let create = |kind: &str| -> Result<HANDLE> {
-                let name = event_name(host, shell, generation, kind);
-                CreateEventW(None, true, false, PCWSTR(name.as_ptr()))
+                let name = event_name(&token, kind);
+                CreateEventW(Some(security.as_ptr()), true, false, PCWSTR(name.as_ptr()))
             };
             let mut session = Self {
                 ready: HANDLE::default(),
                 failed: HANDLE::default(),
                 stop: HANDLE::default(),
                 done: HANDLE::default(),
-                status: StatusChannel::create(
-                    host,
-                    shell,
-                    generation,
-                    std::env::args().any(|arg| arg == "--diagnose"),
-                )?,
+                status: StatusChannel::create(host, shell, generation, inspect, &token)?,
             };
             session.ready = create("Ready")?;
             session.failed = create("Failed")?;
             session.stop = create("Stop")?;
             session.done = create("Done")?;
+
+            let (bridge_path, _bridge_lock) = verify_bridge_dll()?;
             let module = LoadLibraryExW(
                 w!("Windows.UI.Xaml.dll"),
                 None,
@@ -118,35 +501,37 @@ impl XamlSession {
                 let address = GetProcAddress(module, s!("InitializeXamlDiagnosticsEx"))
                     .ok_or_else(Error::from_win32)?;
                 let initialize: InitializeXaml = std::mem::transmute(address);
-                let bridge = std::env::current_exe()?.with_file_name(BRIDGE_FILE);
-                if !bridge.is_file() {
-                    return Err(Error::new(
-                        E_FAIL,
-                        format!("{BRIDGE_FILE} must be in the application folder."),
-                    ));
-                }
-                let bridge = wide(bridge.as_os_str());
-                let init = wide(std::ffi::OsStr::new(&format!(
-                    "{host}:{shell}:{generation}{}",
-                    if std::env::args().any(|arg| arg == "--diagnose") {
-                        ";inspect"
+                let bridge = wide(bridge_path.as_os_str());
+                let init_str = format_init_data(host, shell, generation, inspect, &token)?;
+                let init = wide(std::ffi::OsStr::new(&init_str));
+                let seed = u32::from_str_radix(&token[..4], 16).unwrap_or(generation);
+                let mut last_hr = E_FAIL;
+                for attempt in 0..16u32 {
+                    let slot = if attempt == 0 {
+                        generation
                     } else {
-                        ""
+                        seed.wrapping_add(attempt).max(1)
+                    };
+                    let endpoint =
+                        wide(std::ffi::OsStr::new(&format!("VisualDiagConnection{slot}")));
+                    let hr = initialize(
+                        PCWSTR(endpoint.as_ptr()),
+                        shell,
+                        PCWSTR::null(),
+                        PCWSTR(bridge.as_ptr()),
+                        BRIDGE_CLSID,
+                        PCWSTR(init.as_ptr()),
+                    );
+                    if hr.is_ok() {
+                        protocol::trace("Host.Initialize S_OK");
+                        return Ok(());
                     }
-                )));
-                let endpoint = wide(std::ffi::OsStr::new(&format!(
-                    "VisualDiagConnection{generation}"
-                )));
-                initialize(
-                    PCWSTR(endpoint.as_ptr()),
-                    shell,
-                    PCWSTR::null(),
-                    PCWSTR(bridge.as_ptr()),
-                    BRIDGE_CLSID,
-                    PCWSTR(init.as_ptr()),
-                )
-                .ok()
-                .inspect(|_| protocol::trace("Host.Initialize S_OK"))
+                    last_hr = hr;
+                    if hr != ERROR_ALREADY_EXISTS.to_hresult() {
+                        break;
+                    }
+                }
+                last_hr.ok()
             })();
             let _ = FreeLibrary(module);
             result?;
@@ -386,8 +771,8 @@ fn set_startup(enabled: bool) -> Result<()> {
 }
 
 fn settings_flag(value: PCWSTR, fallback: bool) -> Result<bool> {
-    let mut data = [0u16; 16];
-    let mut bytes = std::mem::size_of_val(&data) as u32;
+    let mut data: u32 = 0;
+    let mut bytes = std::mem::size_of::<u32>() as u32;
     let status = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
@@ -395,7 +780,7 @@ fn settings_flag(value: PCWSTR, fallback: bool) -> Result<bool> {
             value,
             RRF_RT_REG_DWORD,
             None,
-            Some(data.as_mut_ptr().cast()),
+            Some((&mut data as *mut u32).cast()),
             Some(&mut bytes),
         )
     };
@@ -403,7 +788,7 @@ fn settings_flag(value: PCWSTR, fallback: bool) -> Result<bool> {
         return Ok(fallback);
     }
     status.ok()?;
-    Ok(unsafe { *(data.as_ptr().cast::<u32>()) } != 0)
+    Ok(data != 0)
 }
 
 fn set_settings_flag(value: PCWSTR, enabled: bool) -> Result<()> {
@@ -457,6 +842,8 @@ fn apply_menu_theme() {
     }
 }
 
+#[cold]
+#[inline(never)]
 fn show_error(error: &Error) {
     eprintln!("{error}");
     let text = wide(std::ffi::OsStr::new(&format!(
@@ -466,6 +853,22 @@ Share this error message when reporting an issue. Startup log: %LOCALAPPDATA%\\T
     )));
     unsafe {
         MessageBoxW(None, PCWSTR(text.as_ptr()), NAME, MB_OK | MB_ICONERROR);
+    }
+}
+
+/// Hint Windows to release cold one-time startup/WinHTTP pages from the active working set.
+#[cold]
+#[inline(never)]
+fn trim_working_set() {
+    // SAFETY: Passing (usize::MAX, usize::MAX, 0) to SetProcessWorkingSetSizeEx is the documented
+    // Win32 call to trim unused pages from the current process working set.
+    unsafe {
+        let _ = SetProcessWorkingSetSizeEx(
+            GetCurrentProcess(),
+            usize::MAX,
+            usize::MAX,
+            SETPROCESSWORKINGSETSIZEEX_FLAGS(0),
+        );
     }
 }
 
@@ -499,6 +902,9 @@ fn menu(hwnd: HWND, point: POINT) -> Result<usize> {
     apply_menu_theme();
     let enabled = startup_enabled()?;
     let connector = settings_flag(CONNECTOR_VALUE, true)?;
+    let pattern = settings_flag(PATTERN_VALUE, true)?;
+    let reduce_motion = settings_flag(REDUCE_MOTION_VALUE, false)?;
+    let auto_update = settings_flag(AUTO_UPDATE_VALUE, true)?;
     unsafe {
         let popup = CreatePopupMenu()?;
         let result = (|| {
@@ -514,14 +920,12 @@ fn menu(hwnd: HWND, point: POINT) -> Result<usize> {
                 STARTUP,
                 w!("Run at &sign-in"),
             )?;
-            let pattern = settings_flag(PATTERN_VALUE, true)?;
             AppendMenuW(
                 popup,
                 MF_STRING | if pattern { MF_CHECKED } else { MF_UNCHECKED },
                 PATTERN,
                 w!("Connector &pattern"),
             )?;
-            let reduce_motion = settings_flag(REDUCE_MOTION_VALUE, false)?;
             AppendMenuW(
                 popup,
                 MF_STRING
@@ -532,6 +936,17 @@ fn menu(hwnd: HWND, point: POINT) -> Result<usize> {
                     },
                 REDUCE_MOTION,
                 w!("&Reduce connector animation"),
+            )?;
+            AppendMenuW(
+                popup,
+                MF_STRING
+                    | if auto_update {
+                        MF_CHECKED
+                    } else {
+                        MF_UNCHECKED
+                    },
+                AUTO_UPDATE,
+                w!("Check updates at &launch"),
             )?;
             AppendMenuW(popup, MF_SEPARATOR, 0, None)?;
             if let Some(tag) = updater::available_tag() {
@@ -545,6 +960,7 @@ fn menu(hwnd: HWND, point: POINT) -> Result<usize> {
             AppendMenuW(popup, MF_STRING, SAWERIA, w!("Support via Sa&weria"))?;
             AppendMenuW(popup, MF_STRING, EXIT, w!("E&xit"))?;
             let _ = SetForegroundWindow(hwnd);
+            // TPM_RETURNCMD returns the clicked ID directly without dispatching spoofable WM_COMMAND messages.
             let selected = TrackPopupMenu(
                 popup,
                 TPM_RETURNCMD | TPM_RIGHTBUTTON,
@@ -584,6 +1000,7 @@ fn connector_interval(enabled: bool, state: connector::ConnectorState) -> Option
     match state {
         connector::ConnectorState::Active => Some(CONNECTOR_FAST_MS),
         connector::ConnectorState::Settled => Some(CONNECTOR_SETTLED_MS),
+        connector::ConnectorState::Quiescent => Some(CONNECTOR_QUIESCENT_MS),
         connector::ConnectorState::Hidden => Some(CONNECTOR_IDLE_MS),
     }
 }
@@ -595,42 +1012,75 @@ fn connector_style() -> connector::Style {
     }
 }
 
+fn sync_connector_timer(hwnd: HWND, next: Option<u32>, timer_ms: &AtomicU32) -> bool {
+    let desired = next.unwrap_or(0);
+    if timer_ms.load(Ordering::Relaxed) == desired {
+        return true;
+    }
+    unsafe {
+        let _ = KillTimer(hwnd, CONNECTOR_TIMER_ID);
+        if desired == 0 {
+            timer_ms.store(0, Ordering::Relaxed);
+            return true;
+        }
+        if SetTimer(hwnd, CONNECTOR_TIMER_ID, desired, None) != 0 {
+            timer_ms.store(desired, Ordering::Relaxed);
+            true
+        } else {
+            timer_ms.store(0, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
 fn update_connector(
     hwnd: HWND,
     strip: &mut Option<connector::Connector>,
     enabled: bool,
     paused: bool,
-    interval: &mut Option<u32>,
+    style: connector::Style,
 ) {
-    if paused {
+    let was_visible = CONNECTOR_VISIBLE.load(Ordering::Relaxed);
+    if paused || !enabled {
         if let Some(s) = strip.as_mut() {
             s.hide();
         }
-        if interval.is_some() {
-            unsafe {
-                let _ = KillTimer(hwnd, CONNECTOR_TIMER_ID);
-            }
-            *interval = None;
+        if !enabled {
+            // Release the layered window and GDI/USER resources when connector is turned off.
+            drop(strip.take());
+        }
+        CONNECTOR_VISIBLE.store(false, Ordering::Relaxed);
+        let _ = sync_connector_timer(hwnd, None, &CONNECTOR_TIMER_MS);
+        if was_visible || paused {
+            trim_working_set();
         }
         return;
     }
-    let style = connector_style();
+    if strip.is_none() {
+        if !connector::has_eligible_foreground() {
+            CONNECTOR_VISIBLE.store(false, Ordering::Relaxed);
+            let next = connector_interval(true, connector::ConnectorState::Hidden);
+            let _ = sync_connector_timer(hwnd, next, &CONNECTOR_TIMER_MS);
+            return;
+        }
+        *strip = connector::Connector::create().ok();
+    }
     let state = strip
         .as_mut()
-        .and_then(|s| s.update(enabled, style).ok())
+        .and_then(|s| s.update(true, style).ok())
         .unwrap_or(connector::ConnectorState::Hidden);
-    let next = connector_interval(enabled && strip.is_some(), state);
-    if next != *interval {
-        unsafe {
-            let _ = KillTimer(hwnd, CONNECTOR_TIMER_ID);
-            *interval = next.filter(|&ms| SetTimer(hwnd, CONNECTOR_TIMER_ID, ms, None) != 0);
-            if next.is_some() && interval.is_none() {
-                if let Some(s) = strip {
-                    s.hide();
-                }
-                protocol::trace("Connector timer could not be created; strip hidden.");
-            }
+    let now_visible = state != connector::ConnectorState::Hidden;
+    CONNECTOR_VISIBLE.store(now_visible, Ordering::Relaxed);
+    let next = connector_interval(strip.is_some(), state);
+    if !sync_connector_timer(hwnd, next, &CONNECTOR_TIMER_MS) {
+        if let Some(s) = strip.as_mut() {
+            s.hide();
         }
+        CONNECTOR_VISIBLE.store(false, Ordering::Relaxed);
+        protocol::trace("Connector timer could not be created; strip hidden.");
+    }
+    if was_visible && !now_visible {
+        trim_working_set();
     }
 }
 
@@ -639,6 +1089,16 @@ fn schedule(hwnd: HWND, delay_ms: u32) -> Result<()> {
         Err(Error::from_win32())
     } else {
         Ok(())
+    }
+}
+
+fn reconnect_wait_ms(last_connect: Option<Instant>, now: Instant) -> Option<u32> {
+    let elapsed = now.saturating_duration_since(last_connect?);
+    if elapsed >= RECONNECT_COOLDOWN {
+        None
+    } else {
+        let remaining = RECONNECT_COOLDOWN - elapsed;
+        Some(remaining.as_millis().clamp(100, u32::MAX as u128) as u32)
     }
 }
 
@@ -663,6 +1123,9 @@ fn command(hwnd: HWND, id: usize) -> Result<bool> {
             REDUCE_MOTION_VALUE,
             !settings_flag(REDUCE_MOTION_VALUE, false)?,
         )?,
+        AUTO_UPDATE => {
+            set_settings_flag(AUTO_UPDATE_VALUE, !settings_flag(AUTO_UPDATE_VALUE, true)?)?
+        }
         STARTUP => set_startup(!startup_enabled()?)?,
         UPDATE => {
             if updater::available_tag().is_some() {
@@ -676,7 +1139,7 @@ fn command(hwnd: HWND, id: usize) -> Result<bool> {
         ABOUT => unsafe {
             MessageBoxW(
                 None,
-                w!("TransparentBar 0.2.6
+                w!("TransparentBar 0.2.7
 Native Rust, Windows 10 and 11 x64.
 Copyright 2026 Rafly Firmansyah.
 MIT License; may be redistributed under license terms. No warranty.
@@ -708,10 +1171,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
         }
         TRAY_MESSAGE if is_tray_menu((lp.0 as u32) & 0xffff) => {
             let _ = PostMessageW(hwnd, MENU_MESSAGE, wp, lp);
-            LRESULT(0)
-        }
-        WM_COMMAND => {
-            let _ = PostMessageW(hwnd, COMMAND_MESSAGE, wp, lp);
             LRESULT(0)
         }
         WM_POWERBROADCAST => {
@@ -758,15 +1217,54 @@ unsafe extern "system" fn foreground_changed(
     _: u32,
     _: u32,
 ) {
+    if PAUSED.load(Ordering::Relaxed) {
+        return;
+    }
     if event == EVENT_OBJECT_LOCATIONCHANGE
         && (id_object != OBJID_WINDOW.0 || id_child != 0 || target != GetForegroundWindow())
     {
         return;
     }
-    if let Ok(hwnd) = FindWindowW(WINDOW_CLASS, None) {
+    let raw = MAIN_HWND.load(Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    let hwnd = HWND(raw as *mut c_void);
+    if NEEDS_LEGACY_REFRESH.load(Ordering::Relaxed) {
         SetTimer(hwnd, REFRESH_TIMER_ID, 100, None);
-        // Check eligibility now so the strip hides on the next fast tick.
-        SetTimer(hwnd, CONNECTOR_TIMER_ID, CONNECTOR_FAST_MS, None);
+    }
+    if CONNECTOR_ENABLED.load(Ordering::Relaxed) {
+        // Skip waking on normal non-maximized window drags while the strip is already hidden.
+        let wake = event != EVENT_OBJECT_LOCATIONCHANGE
+            || CONNECTOR_VISIBLE.load(Ordering::Relaxed)
+            || IsZoomed(target).as_bool();
+        if wake && CONNECTOR_TIMER_MS.load(Ordering::Relaxed) != CONNECTOR_FAST_MS {
+            // Record the real OS timer period so update_connector relaxes back to idle/settled on the next tick.
+            if SetTimer(hwnd, CONNECTOR_TIMER_ID, CONNECTOR_FAST_MS, None) != 0 {
+                CONNECTOR_TIMER_MS.store(CONNECTOR_FAST_MS, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn sync_location_hook(hook: &mut HWINEVENTHOOK, enabled: bool) {
+    unsafe {
+        if enabled {
+            if hook.is_invalid() {
+                *hook = SetWinEventHook(
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    None,
+                    Some(foreground_changed),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                );
+            }
+        } else if !hook.is_invalid() {
+            let _ = UnhookWinEvent(*hook);
+            *hook = HWINEVENTHOOK::default();
+        }
     }
 }
 
@@ -798,7 +1296,12 @@ fn cleanup_stale_bridges() {
 
 fn run() -> Result<()> {
     unsafe {
-        let mutex = CreateMutexW(None, false, w!(r"Local\TransparentBar.SingleInstance"))?;
+        let security = OwnerSecurityAttributes::current_user()?;
+        let mutex = CreateMutexW(
+            Some(security.as_ptr()),
+            false,
+            w!(r"Local\TransparentBar.SingleInstance"),
+        )?;
         let exists = GetLastError() == ERROR_ALREADY_EXISTS;
         let result = (|| {
             if exists {
@@ -838,6 +1341,7 @@ fn run() -> Result<()> {
                 instance,
                 None,
             )?;
+            MAIN_HWND.store(hwnd.0 as usize, Ordering::Release);
             let foreground_hook = SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND,
                 EVENT_SYSTEM_MINIMIZEEND,
@@ -847,29 +1351,30 @@ fn run() -> Result<()> {
                 0,
                 WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
             );
-            let location_hook = SetWinEventHook(
-                EVENT_OBJECT_LOCATIONCHANGE,
-                EVENT_OBJECT_LOCATIONCHANGE,
-                None,
-                Some(foreground_changed),
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-            );
+            let mut location_hook = HWINEVENTHOOK::default();
             let mut service: Option<TaskbarService> = None;
-            let mut connector = connector::Connector::create().ok();
-            let mut connector_timer = None;
+            let mut connector: Option<connector::Connector> = None;
             let session_registered =
                 WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION).is_ok();
             let mut paused = false;
+            PAUSED.store(false, Ordering::Relaxed);
+            NEEDS_LEGACY_REFRESH.store(true, Ordering::Relaxed);
+            CONNECTOR_VISIBLE.store(false, Ordering::Relaxed);
+            CONNECTOR_TIMER_MS.store(0, Ordering::Relaxed);
             let result = (|| {
                 let mut connector_enabled = settings_flag(CONNECTOR_VALUE, true)?;
+                let mut cached_style = connector_style();
+                CONNECTOR_ENABLED.store(connector_enabled, Ordering::Relaxed);
+                sync_location_hook(&mut location_hook, connector_enabled);
                 let mut tray_ready = false;
                 let mut update_checked = false;
+                let mut trimmed_after_startup = false;
                 let mut retries = 3u8;
                 let mut generation = 1u32;
                 let mut readiness = 20u8;
+                let mut last_connect: Option<Instant> = None;
                 schedule(hwnd, 500)?;
+                trim_working_set();
                 loop {
                     let mut msg = MSG::default();
                     let status = GetMessageW(&mut msg, None, 0, 0).0;
@@ -882,46 +1387,35 @@ fn run() -> Result<()> {
                     match msg.message {
                         POWER_PAUSE_MESSAGE => {
                             paused = true;
+                            PAUSED.store(true, Ordering::Relaxed);
                             update_connector(
                                 hwnd,
                                 &mut connector,
                                 connector_enabled,
                                 paused,
-                                &mut connector_timer,
+                                cached_style,
                             );
                         }
                         POWER_RESUME_MESSAGE => {
                             paused = false;
+                            PAUSED.store(false, Ordering::Relaxed);
                             update_connector(
                                 hwnd,
                                 &mut connector,
                                 connector_enabled,
                                 paused,
-                                &mut connector_timer,
+                                cached_style,
                             );
                             schedule(hwnd, 500)?;
                         }
-                        RECONNECT_MESSAGE => {
-                            service = None;
-                            generation += 1;
-                            readiness = 20;
-                            tray_ready = false;
-                            retries = 3;
-                            schedule(hwnd, 1000)?;
-                        }
-                        REFRESH_MESSAGE => {
-                            connector_enabled =
-                                settings_flag(CONNECTOR_VALUE, true).unwrap_or(false);
-                            schedule(hwnd, 500)?;
-                        }
                         WM_TIMER if is_window_timer(hwnd, &msg, CONNECTOR_TIMER_ID) => {
-                            if connector_timer.is_some() {
+                            if CONNECTOR_TIMER_MS.load(Ordering::Relaxed) != 0 {
                                 update_connector(
                                     hwnd,
                                     &mut connector,
                                     connector_enabled,
                                     paused,
-                                    &mut connector_timer,
+                                    cached_style,
                                 );
                             }
                         }
@@ -933,13 +1427,15 @@ fn run() -> Result<()> {
                                 &mut connector,
                                 connector_enabled,
                                 paused,
-                                &mut connector_timer,
+                                cached_style,
                             );
                             if RESTART.swap(false, Ordering::AcqRel) {
                                 service = None;
-                                generation += 1;
+                                generation = generation.wrapping_add(1).max(1);
                                 readiness = 20;
                                 tray_ready = false;
+                                trimmed_after_startup = false;
+                                NEEDS_LEGACY_REFRESH.store(true, Ordering::Relaxed);
                                 retries = 3;
                             }
                             if !tray_ready {
@@ -948,11 +1444,15 @@ fn run() -> Result<()> {
                                         tray_ready = true;
                                         if !update_checked {
                                             update_checked = true;
-                                            updater::check_in_background(
-                                                hwnd,
-                                                false,
-                                                UPDATE_MESSAGE,
-                                            );
+                                            if settings_flag(AUTO_UPDATE_VALUE, true)
+                                                .unwrap_or(true)
+                                            {
+                                                updater::check_in_background(
+                                                    hwnd,
+                                                    false,
+                                                    UPDATE_MESSAGE,
+                                                );
+                                            }
                                         }
                                     }
                                     Err(_) if retries > 0 => {
@@ -964,6 +1464,12 @@ fn run() -> Result<()> {
                                 }
                             }
                             if service.is_none() {
+                                let now = Instant::now();
+                                if let Some(wait_ms) = reconnect_wait_ms(last_connect, now) {
+                                    schedule(hwnd, wait_ms)?;
+                                    continue;
+                                }
+                                last_connect = Some(now);
                                 match TaskbarService::connect(generation) {
                                     Ok(connected) => {
                                         service = Some(connected);
@@ -989,6 +1495,14 @@ fn run() -> Result<()> {
                                     }
                                     readiness -= 1;
                                     schedule(hwnd, 500)?;
+                                } else {
+                                    // XAML bridge stays active via Explorer callbacks; only legacy Win10 needs foreground refreshes.
+                                    NEEDS_LEGACY_REFRESH
+                                        .store(service.xaml.is_none(), Ordering::Relaxed);
+                                    if !trimmed_after_startup {
+                                        trimmed_after_startup = true;
+                                        trim_working_set();
+                                    }
                                 }
                             }
                         }
@@ -1010,21 +1524,28 @@ fn run() -> Result<()> {
                                                 connector_enabled =
                                                     settings_flag(CONNECTOR_VALUE, true)
                                                         .unwrap_or(false);
+                                                CONNECTOR_ENABLED
+                                                    .store(connector_enabled, Ordering::Relaxed);
+                                                sync_location_hook(
+                                                    &mut location_hook,
+                                                    connector_enabled,
+                                                );
                                                 update_connector(
                                                     hwnd,
                                                     &mut connector,
                                                     connector_enabled,
                                                     paused,
-                                                    &mut connector_timer,
+                                                    cached_style,
                                                 );
                                             }
                                             if selected == PATTERN || selected == REDUCE_MOTION {
+                                                cached_style = connector_style();
                                                 update_connector(
                                                     hwnd,
                                                     &mut connector,
                                                     connector_enabled,
                                                     paused,
-                                                    &mut connector_timer,
+                                                    cached_style,
                                                 );
                                             }
                                         }
@@ -1084,35 +1605,7 @@ fn run() -> Result<()> {
                                 }
                                 _ => (),
                             }
-                        }
-                        WM_COMMAND | COMMAND_MESSAGE => {
-                            let selected = msg.wParam.0 & 0xffff;
-                            match command(hwnd, selected) {
-                                Ok(true) => break,
-                                Ok(false) => {
-                                    if selected == CONNECTOR {
-                                        connector_enabled =
-                                            settings_flag(CONNECTOR_VALUE, true).unwrap_or(false);
-                                        update_connector(
-                                            hwnd,
-                                            &mut connector,
-                                            connector_enabled,
-                                            paused,
-                                            &mut connector_timer,
-                                        );
-                                    }
-                                    if selected == PATTERN || selected == REDUCE_MOTION {
-                                        update_connector(
-                                            hwnd,
-                                            &mut connector,
-                                            connector_enabled,
-                                            paused,
-                                            &mut connector_timer,
-                                        );
-                                    }
-                                }
-                                Err(error) => show_error(&error),
-                            }
+                            trim_working_set();
                         }
                         _ => {
                             let _ = TranslateMessage(&msg);
@@ -1122,6 +1615,10 @@ fn run() -> Result<()> {
                 }
                 Ok(())
             })();
+            MAIN_HWND.store(0, Ordering::Release);
+            CONNECTOR_ENABLED.store(false, Ordering::Relaxed);
+            CONNECTOR_VISIBLE.store(false, Ordering::Relaxed);
+            CONNECTOR_TIMER_MS.store(0, Ordering::Relaxed);
             let _ = KillTimer(hwnd, CONNECTOR_TIMER_ID);
             let _ = KillTimer(hwnd, REFRESH_TIMER_ID);
             if session_registered {
@@ -1175,10 +1672,10 @@ fn enable_dpi_awareness() -> bool {
 fn diagnose() -> Result<()> {
     protocol::trace("Host.Diagnose start");
     let session = XamlSession::connect(2)?;
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let mut ready = false;
     unsafe {
-        while start.elapsed() < std::time::Duration::from_secs(8) {
+        while start.elapsed() < Duration::from_secs(8) {
             let mut message = MSG::default();
             while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
                 let _ = TranslateMessage(&message);
@@ -1202,6 +1699,8 @@ fn diagnose() -> Result<()> {
 }
 
 fn main() {
+    harden_process();
+    protocol::trim_log_if_oversized();
     protocol::trace("Host.Main");
     enable_dpi_awareness();
     unsafe {
@@ -1320,6 +1819,10 @@ mod tests {
             Some(64)
         );
         assert_eq!(
+            connector_interval(true, connector::ConnectorState::Quiescent),
+            Some(250)
+        );
+        assert_eq!(
             connector_interval(true, connector::ConnectorState::Hidden),
             Some(1000)
         );
@@ -1329,6 +1832,10 @@ mod tests {
         );
         assert_eq!(
             connector_interval(false, connector::ConnectorState::Settled),
+            None
+        );
+        assert_eq!(
+            connector_interval(false, connector::ConnectorState::Quiescent),
             None
         );
         assert_eq!(
@@ -1390,6 +1897,7 @@ mod tests {
             REDUCE_MOTION,
             SUPPORT,
             SAWERIA,
+            AUTO_UPDATE,
         ];
         for (index, id) in commands.iter().enumerate() {
             assert!(!commands[..index].contains(id), "duplicate menu command ID");
@@ -1493,6 +2001,10 @@ mod tests {
             Some("v0.1.6".to_string())
         );
         assert_eq!(
+            updater::extract_tag_from_location("https://evil.example/releases/tag/v9.9.9"),
+            None
+        );
+        assert_eq!(
             updater::extract_tag_from_json(r#"{"tag_name": "v0.2.0", "draft": false}"#),
             Some("v0.2.0".to_string())
         );
@@ -1506,6 +2018,48 @@ mod tests {
         assert!(updater::is_newer("v0.2.0", "0.1.5"));
         assert!(!updater::is_newer("v0.1.5", "0.1.5"));
         assert!(!updater::is_newer("v0.1.4", "0.1.5"));
+    }
+
+    #[test]
+    fn explorer_path_verification_matches_only_system_root_explorer() {
+        assert!(is_expected_explorer_path(
+            r"C:\Windows\explorer.exe",
+            r"C:\Windows"
+        ));
+        assert!(is_expected_explorer_path(
+            r"\\?\c:\WINDOWS\EXPLORER.EXE",
+            r"C:\Windows\"
+        ));
+        assert!(!is_expected_explorer_path(
+            r"C:\Users\Public\explorer.exe",
+            r"C:\Windows"
+        ));
+        assert!(!is_expected_explorer_path(
+            r"C:\Windows\System32\explorer.exe",
+            r"C:\Windows"
+        ));
+        assert!(!is_expected_explorer_path(
+            r"C:\Windows\notepad.exe",
+            r"C:\Windows"
+        ));
+    }
+
+    #[test]
+    fn remote_and_unc_paths_are_rejected_for_bridge_dll() {
+        assert!(reject_remote_or_unc_path(r"\\server\share\transparentbar").is_err());
+        assert!(reject_remote_or_unc_path(r"\\?\UNC\server\share\transparentbar").is_err());
+        assert!(reject_remote_or_unc_path(r"relative\path").is_err());
+    }
+
+    #[test]
+    fn reconnect_cooldown_rate_limits_reattachment() {
+        let base = Instant::now();
+        assert_eq!(reconnect_wait_ms(None, base), None);
+        assert!(reconnect_wait_ms(Some(base), base + Duration::from_millis(500)).is_some());
+        assert_eq!(
+            reconnect_wait_ms(Some(base), base + RECONNECT_COOLDOWN),
+            None
+        );
     }
 
     #[test]
@@ -1529,5 +2083,16 @@ mod tests {
         assert!(!old_bak.exists());
         assert!(unrelated.exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn connector_timer_sync_reprograms_when_foreground_wake_overrides_period() {
+        let tracked = AtomicU32::new(CONNECTOR_IDLE_MS);
+        // Simulate foreground_changed accelerating the OS timer to 16 ms.
+        tracked.store(CONNECTOR_FAST_MS, Ordering::Relaxed);
+        // Next idle tick must observe 16 != 1000 so it reprograms back to 1000 ms (not stuck at 16 ms).
+        let desired = connector_interval(true, connector::ConnectorState::Hidden).unwrap();
+        assert_ne!(tracked.load(Ordering::Relaxed), desired);
+        assert_eq!(desired, CONNECTOR_IDLE_MS);
     }
 }
